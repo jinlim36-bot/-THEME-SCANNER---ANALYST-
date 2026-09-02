@@ -1,0 +1,6 @@
+streamlit
+pandas
+finance-datareader
+google-genai
+lxml
+requests
