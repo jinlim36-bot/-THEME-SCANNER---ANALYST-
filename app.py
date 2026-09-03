@@ -9,8 +9,9 @@ from google import genai
 # =============================================================
 # [API 및 모델 설정]
 # =============================================================
-DEFAULT_API_KEY = "여기에_AQ로_시작하는_키를_붙여넣으세요"
-GEMINI_MODEL = "gemini-3.6-flash"  # 최신 권장 모델 지정
+# 1. Streamlit Secrets에 저장된 키가 있으면 우선 로드, 없으면 빈 문자열
+DEFAULT_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = "gemini-3.6-flash"
 
 # -------------------------------------------------------------
 # 0. UI 설정 및 클라이언트 초기화
@@ -21,18 +22,19 @@ st.set_page_config(
     layout="wide"
 )
 
+# Secrets에 키가 이미 등록되어 있다면 사이드바 입력을 생략하거나 수정 가능하게 처리
 st.sidebar.header("🔑 Gemini API 설정")
 input_key = st.sidebar.text_input(
     "API Key 입력",
-    value="" if "여기에" in DEFAULT_API_KEY else DEFAULT_API_KEY,
+    value=DEFAULT_API_KEY,
     type="password",
-    help="AQ.로 시작하는 59자리 키를 입력하세요."
+    help="Secrets에 등록되어 있으면 자동으로 적용됩니다. 필요 시 직접 덮어쓸 수 있습니다."
 )
 
-active_key = input_key.strip() if input_key.strip() else (DEFAULT_API_KEY if "여기에" not in DEFAULT_API_KEY else "")
+active_key = input_key.strip() if input_key.strip() else DEFAULT_API_KEY
 
 if not active_key:
-    st.warning("👈 왼쪽 사이드바에 발급받으신 Gemini API 키(AQ....)를 붙여넣어 주세요.")
+    st.warning("👈 왼쪽 사이드바에 Gemini API 키를 입력하거나 Streamlit Secrets에 GEMINI_API_KEY를 설정하세요.")
     st.stop()
 
 # Gemini SDK 클라이언트 생성
