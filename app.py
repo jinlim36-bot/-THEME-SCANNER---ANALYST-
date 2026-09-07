@@ -3,18 +3,18 @@ import pandas as pd
 import datetime
 import requests
 import io
+import time
 import FinanceDataReader as fdr
 from google import genai
 
 # =============================================================
-# [API 및 모델 설정]
+# [API 및 모델 우선순위 설정]
 # =============================================================
-# 1. Streamlit Secrets에 저장된 키가 있으면 우선 로드, 없으면 빈 문자열
-DEFAULT_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-3.6-flash"
+DEFAULT_API_KEY = "여기에_AQ로_시작하는_키를_붙여넣으세요"
+MODEL_CANDIDATES = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
 
 # -------------------------------------------------------------
-# 0. UI 설정 및 클라이언트 초기화
+# 0. UI 설정 및 API Key 자동 로드
 # -------------------------------------------------------------
 st.set_page_config(
     page_title="종목 검색기 (THEME SCANNER - ANALYST)",
@@ -22,20 +22,31 @@ st.set_page_config(
     layout="wide"
 )
 
-# Secrets에 키가 이미 등록되어 있다면 사이드바 입력을 생략하거나 수정 가능하게 처리
+# 1. secrets.toml 또는 Streamlit Cloud Secrets에서 키 자동 추출
+secret_key = ""
+try:
+    if "GEMINI_API_KEY" in st.secrets:
+        secret_key = st.secrets["GEMINI_API_KEY"].strip()
+except Exception:
+    pass
+
+# 2. 사이드바 설정 (secrets에 키가 있으면 기본값으로 자동 채움)
 st.sidebar.header("🔑 Gemini API 설정")
 input_key = st.sidebar.text_input(
-    "API Key 입력",
-    value=DEFAULT_API_KEY,
+    "API Key (자동 로드됨)",
+    value=secret_key if secret_key else ("" if "여기에" in DEFAULT_API_KEY else DEFAULT_API_KEY),
     type="password",
-    help="Secrets에 등록되어 있으면 자동으로 적용됩니다. 필요 시 직접 덮어쓸 수 있습니다."
+    help="secrets.toml에 등록된 키가 자동으로 적용됩니다."
 )
 
-active_key = input_key.strip() if input_key.strip() else DEFAULT_API_KEY
+# 3. 우선순위: 사이드바 입력값 -> secrets.toml -> 기본 변수
+active_key = input_key.strip() if input_key.strip() else (secret_key if secret_key else (DEFAULT_API_KEY if "여기에" not in DEFAULT_API_KEY else ""))
 
 if not active_key:
-    st.warning("👈 왼쪽 사이드바에 Gemini API 키를 입력하거나 Streamlit Secrets에 GEMINI_API_KEY를 설정하세요.")
+    st.warning("👈 .streamlit/secrets.toml에 GEMINI_API_KEY를 등록하거나 사이드바에 키를 입력해 주세요.")
     st.stop()
+else:
+    st.sidebar.success("✅ API 키 인증 완료")
 
 # Gemini SDK 클라이언트 생성
 try:
@@ -43,6 +54,30 @@ try:
 except Exception as e:
     st.error(f"API 클라이언트 초기화 오류: {e}")
     st.stop()
+
+# -------------------------------------------------------------
+# [안전 호출 함수] 503 과부하 대응 자동 재시도 & 모델 폴백 로직
+# -------------------------------------------------------------
+def generate_content_with_retry(client, prompt, max_retries=3):
+    last_error = None
+    for model_name in MODEL_CANDIDATES:
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+                return response.text
+            except Exception as e:
+                err_str = str(e)
+                last_error = err_str
+                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                    wait_time = (attempt + 1) * 2
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    break
+    raise Exception(f"모든 재시도 및 모델 전환 실패. 원인: {last_error}")
 
 # -------------------------------------------------------------
 # [보조 함수] 네이버 금융에서 외인/기관 20거래일 누적 수급 집계
@@ -75,7 +110,7 @@ def get_investor_sentiment(code):
     return 0, 0
 
 st.title("📈 종목 검색기 (THEME SCANNER - ANALYST)")
-st.caption(f"ENGINE: Google {GEMINI_MODEL} | DATA: Naver Finance, KRX Open Feed")
+st.caption("ENGINE: Google Gemini (Active Fallback) | DATA: Naver Finance, KRX Open Feed")
 
 tab1, tab2, tab3 = st.tabs(["STEP 1 · 수급 테마 검색", "STEP 2 · 종목 분석", "📖 사용 매뉴얼"])
 
@@ -145,7 +180,7 @@ with tab1:
 
     if "screened_df" in st.session_state and not st.session_state["screened_df"].empty:
         df_display = st.session_state["screened_df"]
-        st.dataframe(df_display, use_container_width=True)
+        st.dataframe(df_display, width='stretch')
 
         stock_names = df_display["종목명"].tolist()
         theme_prompt = f"""
@@ -164,13 +199,10 @@ with tab1:
         """
         
         if st.button("테마 및 주도주 AI 분류 (Gemini)"):
-            with st.spinner("Gemini가 실시간 주도 테마와 대장주를 분류하고 있습니다..."):
+            with st.spinner("Gemini가 실시간 주도 테마와 대장주를 분류하고 있습니다 (서버 응답 대기 중)..."):
                 try:
-                    response = client.models.generate_content(
-                        model=GEMINI_MODEL,
-                        contents=theme_prompt
-                    )
-                    st.markdown(response.text)
+                    result_text = generate_content_with_retry(client, theme_prompt)
+                    st.markdown(result_text)
                 except Exception as e:
                     st.error(f"분류 생성 중 오류 발생: {e}")
 
@@ -231,11 +263,8 @@ with tab2:
                               * 손절 기준선: (이탈 시 대응할 손절 가격)
                         """
 
-                        response = client.models.generate_content(
-                            model=GEMINI_MODEL,
-                            contents=analysis_prompt
-                        )
-                        st.markdown(response.text)
+                        result_text = generate_content_with_retry(client, analysis_prompt)
+                        st.markdown(result_text)
 
                 except Exception as e:
                     st.error(f"분석 중 오류 발생: {e}")
