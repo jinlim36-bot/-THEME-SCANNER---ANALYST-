@@ -11,7 +11,7 @@ from google import genai
 # [API 및 모델 우선순위 설정]
 # =============================================================
 DEFAULT_API_KEY = "여기에_AQ로_시작하는_키를_붙여넣으세요"
-MODEL_CANDIDATES = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+MODEL_CANDIDATES = ["gemini-3.6-flash"]
 
 # -------------------------------------------------------------
 # 0. UI 설정 및 API Key 자동 로드
