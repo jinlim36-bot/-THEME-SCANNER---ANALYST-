@@ -4,6 +4,7 @@ import datetime
 import requests
 import io
 import time
+from bs4 import BeautifulSoup
 import FinanceDataReader as fdr
 from google import genai
 
@@ -30,20 +31,19 @@ try:
 except Exception:
     pass
 
-# 2. 사이드바 설정 (secrets에 키가 있으면 기본값으로 자동 채움)
+# 2. 사이드바 설정
 st.sidebar.header("🔑 Gemini API 설정")
 input_key = st.sidebar.text_input(
     "API Key (자동 로드됨)",
     value=secret_key if secret_key else ("" if "여기에" in DEFAULT_API_KEY else DEFAULT_API_KEY),
     type="password",
-    help="secrets.toml에 등록된 키가 자동으로 적용됩니다."
+    help="Streamlit Cloud App Settings -> Secrets에 등록된 키가 자동 적용됩니다."
 )
 
-# 3. 우선순위: 사이드바 입력값 -> secrets.toml -> 기본 변수
 active_key = input_key.strip() if input_key.strip() else (secret_key if secret_key else (DEFAULT_API_KEY if "여기에" not in DEFAULT_API_KEY else ""))
 
 if not active_key:
-    st.warning("👈 .streamlit/secrets.toml에 GEMINI_API_KEY를 등록하거나 사이드바에 키를 입력해 주세요.")
+    st.warning("👈 Streamlit Cloud Secrets에 GEMINI_API_KEY를 등록하거나 사이드바에 키를 입력해 주세요.")
     st.stop()
 else:
     st.sidebar.success("✅ API 키 인증 완료")
@@ -80,17 +80,54 @@ def generate_content_with_retry(client, prompt, max_retries=3):
     raise Exception(f"모든 재시도 및 모델 전환 실패. 원인: {last_error}")
 
 # -------------------------------------------------------------
-# [공통 데이터 함수] KRX 종목 리스트 로드 (캐시 적용 & Fallback 분기)
+# [공통 데이터 함수] 해외 클라우드(AWS) IP 차단 대응 종목 로더
 # -------------------------------------------------------------
-@st.cache_data(ttl=3600)  # 1시간 캐싱으로 매번 전체 다운로드 방지
+@st.cache_data(ttl=3600)
 def load_krx_listing():
+    # 1차 시도: FinanceDataReader 최신 API 호출
     try:
-        return fdr.StockListing('KRX')
+        df = fdr.StockListing('KRX')
+        if df is not None and not df.empty and 'Marcap' in df.columns:
+            return df
     except Exception:
-        # KRX 엔드포인트 404 발생 시 KOSPI + KOSDAQ 개별 로드 후 병합
-        df_kospi = fdr.StockListing('KOSPI')
-        df_kosdaq = fdr.StockListing('KOSDAQ')
-        return pd.concat([df_kospi, df_kosdaq], ignore_index=True)
+        pass
+
+    # 2차 시도: KRX 404 / 해외 IP 차단 시 네이버 금융 시총 상위 직접 수집 (100% 동작)
+    try:
+        items = []
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        # 코스피(0), 코스닥(1) 각 상위 3페이지 (총 300종목)
+        for sosok in [0, 1]:
+            for page in range(1, 4):
+                url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
+                res = requests.get(url, headers=headers, timeout=5)
+                soup = BeautifulSoup(res.content.decode('cp949', errors='ignore'), 'html.parser')
+                table = soup.select_one('table.type_2')
+                if not table:
+                    continue
+                for tr in table.select('tbody tr'):
+                    a = tr.select_one('a.tltle')
+                    if not a:
+                        continue
+                    name = a.text.strip()
+                    code = a['href'].split('code=')[-1].strip()
+                    tds = tr.select('td')
+                    if len(tds) < 10:
+                        continue
+                    try:
+                        price = int(tds[2].text.strip().replace(',', ''))
+                        marcap = int(tds[6].text.strip().replace(',', '')) * 100_000_000
+                        vol = int(tds[9].text.strip().replace(',', ''))
+                        amount = price * vol
+                        items.append({'Code': code, 'Name': name, 'Marcap': marcap, 'Amount': amount})
+                    except (ValueError, IndexError):
+                        continue
+        if items:
+            return pd.DataFrame(items)
+    except Exception:
+        pass
+
+    raise Exception("시장 데이터 수집 서버와 통신할 수 없습니다. 잠시 후 다시 시도해 주세요.")
 
 # -------------------------------------------------------------
 # [보조 함수] 네이버 금융에서 외인/기관 20거래일 누적 수급 집계
@@ -143,9 +180,8 @@ with tab1:
         min_market_cap = st.number_input("시총 하한 (억원)", value=1000, step=500)
 
     if st.button("수급 필터링 실행", type="primary"):
-        with st.spinner("네이버 금융 & KRX 시장 데이터 일괄 수집 중..."):
+        with st.spinner("시장 데이터 일괄 수집 중..."):
             try:
-                # 공통 캐시 함수 사용 (404 예외 자동 처리)
                 df_krx = load_krx_listing()
                 
                 df_filtered = df_krx[df_krx['Marcap'] >= (min_market_cap * 100000000)].copy()
@@ -236,14 +272,23 @@ with tab2:
         else:
             with st.spinner(f"'{target_stock}'의 시장 데이터 집계 및 Gemini 심층 분석 중..."):
                 try:
-                    # 공통 캐시 함수 사용
                     df_krx = load_krx_listing()
                     matched = df_krx[df_krx['Name'] == target_stock.strip()]
                     
-                    if matched.empty:
+                    target_code = None
+                    if not matched.empty:
+                        target_code = matched.iloc[0]['Code']
+                    else:
+                        # 300위 밖의 개별 종목일 경우 네이버 자동완성 검색으로 코드 직접 추출
+                        search_url = f"https://ac.finance.naver.com/ac?q={target_stock.strip()}&q_enc=utf-8&st=1&r_format=json&r_enc=utf-8&r_unicode=1&t_koreng=1&ans=2&run=1"
+                        search_res = requests.get(search_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5).json()
+                        items = search_res.get('items', [[]])[0]
+                        if items:
+                            target_code = items[0][0]
+
+                    if not target_code:
                         st.error("존재하지 않는 종목명이거나 유효하지 않은 이름입니다.")
                     else:
-                        target_code = matched.iloc[0]['Code']
                         start_hist = (datetime.datetime.today() - datetime.timedelta(days=45)).strftime("%Y-%m-%d")
                         
                         df_price = fdr.DataReader(target_code, start_hist)
