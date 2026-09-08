@@ -12,7 +12,8 @@ from google import genai
 # [API 및 모델 우선순위 설정]
 # =============================================================
 DEFAULT_API_KEY = "여기에_AQ로_시작하는_키를_붙여넣으세요"
-MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-1.5-flash"]
+# 현재 Google Gemini 정식 서비스 중인 Flash 모델 리스트
+MODEL_CANDIDATES = ["gemini-2.0-flash", "gemini-2.0-flash-lite"]
 
 # -------------------------------------------------------------
 # 0. UI 설정 및 API Key 자동 로드
@@ -56,11 +57,37 @@ except Exception as e:
     st.stop()
 
 # -------------------------------------------------------------
-# [안전 호출 함수] 503 과부하 대응 자동 재시도 & 모델 폴백 로직
+# [자동 모델 탐색 및 안전 호출 함수]
 # -------------------------------------------------------------
+@st.cache_data(ttl=3600)
+def get_available_gemini_models(_client):
+    """사용자 API 키에서 현재 generateContent를 지원하는 모델 자동 감지"""
+    preferred_order = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-2.5-flash"]
+    try:
+        supported = []
+        for m in _client.models.list():
+            actions = getattr(m, 'supported_actions', []) or []
+            if 'generateContent' in actions:
+                clean_name = m.name.replace('models/', '')
+                supported.append(clean_name)
+        
+        # 선호 모델 우선 배치
+        candidates = [p for p in preferred_order if p in supported]
+        for s in supported:
+            if s not in candidates and "flash" in s:
+                candidates.append(s)
+        if candidates:
+            return candidates
+    except Exception:
+        pass
+    return MODEL_CANDIDATES
+
 def generate_content_with_retry(client, prompt, max_retries=3):
     last_error = None
-    for model_name in MODEL_CANDIDATES:
+    # 내 계정에서 실제 사용 가능한 모델 목록 자동 조회
+    models_to_try = get_available_gemini_models(client)
+    
+    for model_name in models_to_try:
         for attempt in range(max_retries):
             try:
                 response = client.models.generate_content(
@@ -71,11 +98,13 @@ def generate_content_with_retry(client, prompt, max_retries=3):
             except Exception as e:
                 err_str = str(e)
                 last_error = err_str
+                # 일시적 과부하/속도제한(503, 429) 시 대기 후 재시도
                 if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
                     wait_time = (attempt + 1) * 2
                     time.sleep(wait_time)
                     continue
                 else:
+                    # 404 등 모델 미지원 시 즉시 다음 후보 모델로 폴백
                     break
     raise Exception(f"모든 재시도 및 모델 전환 실패. 원인: {last_error}")
 
@@ -84,7 +113,6 @@ def generate_content_with_retry(client, prompt, max_retries=3):
 # -------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def load_krx_listing():
-    # 1차 시도: FinanceDataReader 최신 API 호출
     try:
         df = fdr.StockListing('KRX')
         if df is not None and not df.empty and 'Marcap' in df.columns:
@@ -92,12 +120,10 @@ def load_krx_listing():
     except Exception:
         pass
 
-    # 2차 시도: KRX 404 / 해외 IP 차단 시 네이버 금융 시총 상위 직접 수집 (100% 동작)
     try:
         items = []
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        # 코스피(0), 코스닥(1) 각 상위 3페이지 (총 300종목)
-        for sosok in [0, 1]:
+        for sosok in [0, 1]:  # 코스피, 코스닥
             for page in range(1, 4):
                 url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
                 res = requests.get(url, headers=headers, timeout=5)
@@ -279,7 +305,6 @@ with tab2:
                     if not matched.empty:
                         target_code = matched.iloc[0]['Code']
                     else:
-                        # 300위 밖의 개별 종목일 경우 네이버 자동완성 검색으로 코드 직접 추출
                         search_url = f"https://ac.finance.naver.com/ac?q={target_stock.strip()}&q_enc=utf-8&st=1&r_format=json&r_enc=utf-8&r_unicode=1&t_koreng=1&ans=2&run=1"
                         search_res = requests.get(search_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5).json()
                         items = search_res.get('items', [[]])[0]
