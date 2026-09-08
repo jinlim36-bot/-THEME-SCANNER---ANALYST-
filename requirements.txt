@@ -1,7 +1,7 @@
 streamlit
 pandas
 requests
-lxml
 beautifulsoup4
-finance-datareader>=0.9.96
+lxml
+finance-datareader>=0.9.102
 google-genai
