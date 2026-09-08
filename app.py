@@ -80,6 +80,19 @@ def generate_content_with_retry(client, prompt, max_retries=3):
     raise Exception(f"모든 재시도 및 모델 전환 실패. 원인: {last_error}")
 
 # -------------------------------------------------------------
+# [공통 데이터 함수] KRX 종목 리스트 로드 (캐시 적용 & Fallback 분기)
+# -------------------------------------------------------------
+@st.cache_data(ttl=3600)  # 1시간 캐싱으로 매번 전체 다운로드 방지
+def load_krx_listing():
+    try:
+        return fdr.StockListing('KRX')
+    except Exception:
+        # KRX 엔드포인트 404 발생 시 KOSPI + KOSDAQ 개별 로드 후 병합
+        df_kospi = fdr.StockListing('KOSPI')
+        df_kosdaq = fdr.StockListing('KOSDAQ')
+        return pd.concat([df_kospi, df_kosdaq], ignore_index=True)
+
+# -------------------------------------------------------------
 # [보조 함수] 네이버 금융에서 외인/기관 20거래일 누적 수급 집계
 # -------------------------------------------------------------
 def get_investor_sentiment(code):
@@ -132,12 +145,9 @@ with tab1:
     if st.button("수급 필터링 실행", type="primary"):
         with st.spinner("네이버 금융 & KRX 시장 데이터 일괄 수집 중..."):
             try:
-                df_krx = fdr.StockListing('KRX')
-            except Exception:
-                # KRX 전체 조회가 실패할 경우 코스피/코스닥 개별 병합
-                df_kospi = fdr.StockListing('KOSPI')
-                df_kosdaq = fdr.StockListing('KOSDAQ')
-                df_krx = pd.concat([df_kospi, df_kosdaq], ignore_index=True)
+                # 공통 캐시 함수 사용 (404 예외 자동 처리)
+                df_krx = load_krx_listing()
+                
                 df_filtered = df_krx[df_krx['Marcap'] >= (min_market_cap * 100000000)].copy()
                 df_filtered = df_filtered.sort_values(by="Amount", ascending=False).head(candidate_pool)
                 
@@ -216,7 +226,7 @@ with tab1:
 # -------------------------------------------------------------
 with tab2:
     st.subheader("종목 심층 분석 (AI Analyst)")
-    st.caption("기업 펀더멘털, 차트 위치, 외인/기관 20일 수급을 집계하여 AI 7단계 정밀 리포트를 제공합니다.")
+    st.caption("기업 펀더멘털, 차트 위치, 외인/기관 20일 수급을 집계하여 AI 정밀 리포트를 제공합니다.")
     
     target_stock = st.text_input("분석할 종목명을 입력하세요 (예: 삼성전자, SK하이닉스)")
 
@@ -226,12 +236,8 @@ with tab2:
         else:
             with st.spinner(f"'{target_stock}'의 시장 데이터 집계 및 Gemini 심층 분석 중..."):
                 try:
-                    df_krx = fdr.StockListing('KRX')
-                except Exception:
-                # KRX 전체 조회가 실패할 경우 코스피/코스닥 개별 병합
-                       df_kospi = fdr.StockListing('KOSPI')
-                       df_kosdaq = fdr.StockListing('KOSDAQ')
-                       df_krx = pd.concat([df_kospi, df_kosdaq], ignore_index=True)
+                    # 공통 캐시 함수 사용
+                    df_krx = load_krx_listing()
                     matched = df_krx[df_krx['Name'] == target_stock.strip()]
                     
                     if matched.empty:
@@ -261,6 +267,7 @@ with tab2:
                         [출력 형식 - 각 번호와 항목명을 그대로 유지할 것]
                         1단계. 종목 기본 정보 (비즈니스 모델, 주요 매출원)
                         2단계. 최근 시장 재료 및 공시 분석 (섹터 동향 및 호재/악재)
+                        3단계. 재무 건전성 및 밸류에이션 요약
                         4단계. 외국인·기관 수급 평가 (순매수 수량 기반 메이저 자금의 매집 강도 진단)
                         5단계. 차트와 가격 위치 (20일 변동폭 내 위치 및 핵심 지지/저항 라인)
                         6단계. 리스크 요인 (변동성, 업황 불확실성, 밸류에이션 등)
