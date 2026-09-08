@@ -11,7 +11,7 @@ from google import genai
 # [API 및 모델 우선순위 설정]
 # =============================================================
 DEFAULT_API_KEY = "여기에_AQ로_시작하는_키를_붙여넣으세요"
-MODEL_CANDIDATES = ["gemini-3.6-flash,gemini-2.5-flash"]
+MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-1.5-flash"]
 
 # -------------------------------------------------------------
 # 0. UI 설정 및 API Key 자동 로드
@@ -133,6 +133,11 @@ with tab1:
         with st.spinner("네이버 금융 & KRX 시장 데이터 일괄 수집 중..."):
             try:
                 df_krx = fdr.StockListing('KRX')
+            except Exception:
+                # KRX 전체 조회가 실패할 경우 코스피/코스닥 개별 병합
+                df_kospi = fdr.StockListing('KOSPI')
+                df_kosdaq = fdr.StockListing('KOSDAQ')
+                df_krx = pd.concat([df_kospi, df_kosdaq], ignore_index=True)
                 df_filtered = df_krx[df_krx['Marcap'] >= (min_market_cap * 100000000)].copy()
                 df_filtered = df_filtered.sort_values(by="Amount", ascending=False).head(candidate_pool)
                 
@@ -222,6 +227,11 @@ with tab2:
             with st.spinner(f"'{target_stock}'의 시장 데이터 집계 및 Gemini 심층 분석 중..."):
                 try:
                     df_krx = fdr.StockListing('KRX')
+                except Exception:
+                # KRX 전체 조회가 실패할 경우 코스피/코스닥 개별 병합
+                       df_kospi = fdr.StockListing('KOSPI')
+                       df_kosdaq = fdr.StockListing('KOSDAQ')
+                       df_krx = pd.concat([df_kospi, df_kosdaq], ignore_index=True)
                     matched = df_krx[df_krx['Name'] == target_stock.strip()]
                     
                     if matched.empty:
