@@ -7,6 +7,7 @@ import io
 import time
 import math
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 import FinanceDataReader as fdr
 from google import genai
@@ -263,6 +264,55 @@ def load_krx_listing():
         pass
 
     return pd.DataFrame()
+
+# -------------------------------------------------------------
+# [스크리너 성능] 최근 시세 지표를 제한 병렬 조회하고 1시간 캐시
+# -------------------------------------------------------------
+def _get_screening_metrics(code, start_date):
+    """Streamlit UI와 분리된 단일 종목 조회 함수."""
+    try:
+        hist = fdr.DataReader(code, start_date)
+        required_cols = ['Close', 'Volume']
+        if hist is None or len(hist) < 25 or not all(c in hist.columns for c in required_cols):
+            return {"code": code, "ok": False, "error": "최근 OHLCV 데이터 부족"}
+
+        last_close = hist['Close'].iloc[-1]
+        prev_close = hist['Close'].iloc[-2]
+        close_5d = hist['Close'].iloc[-6]
+        last_vol = hist['Volume'].iloc[-1]
+        prev_vol = hist['Volume'].iloc[-2]
+        avg_vol_20d = hist['Volume'].iloc[-21:-1].mean()
+
+        values = [last_close, prev_close, close_5d, last_vol, prev_vol, avg_vol_20d]
+        if any(pd.isna(v) for v in values) or prev_close <= 0 or close_5d <= 0 or last_vol < 0:
+            return {"code": code, "ok": False, "error": "가격 또는 거래량 결측/비정상"}
+
+        return {
+            "code": code,
+            "ok": True,
+            "last_close": float(last_close),
+            "return_1d": (last_close - prev_close) / prev_close * 100,
+            "return_5d": (last_close - close_5d) / close_5d * 100,
+            "vol_ratio_20d": last_vol / max(avg_vol_20d, 1),
+            "vol_ratio_prev": last_vol / max(prev_vol, 1),
+        }
+    except Exception as e:
+        return {"code": code, "ok": False, "error": str(e)}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_screening_metrics_batch(codes, scan_date):
+    """같은 날짜·대상 풀은 재실행 시 네트워크 호출 없이 재사용한다."""
+    start_date = (datetime.datetime.fromisoformat(scan_date) - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
+    workers = min(8, len(codes))
+    if workers == 0:
+        return []
+
+    results = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_get_screening_metrics, code, start_date) for code in codes]
+        for future in as_completed(futures):
+            results.append(future.result())
+    return results
 
 # -------------------------------------------------------------
 # [안전 종목 검색 함수]
@@ -696,18 +746,20 @@ tab1, tab2, tab3 = st.tabs(["STEP 1 · 주도 후보 스크리너", "STEP 2 · �
 # -------------------------------------------------------------
 with tab1:
     st.subheader("🎯 STEP 1 · 주도 수급 스크리너")
-    st.caption("주도주 조건: 5일 누적 상승률 ≥ 7% | 거래대금 상위 30% | 20일 거래량 ≥ 2.0x | 시총 ≥ 2,000억 | 당일 등락률 ≥ -2.0%")
+    st.caption("주도주 조건: 5일 누적 상승률 ≥ 7% | 거래대금 상위 설정 비율(상세 조회 상한 적용) | 20일 거래량 ≥ 2.0x | 시총 ≥ 2,000억 | 당일 등락률 ≥ -2.0%")
     
     col1, col2, col3 = st.columns(3)
     with col1:
         min_return_5d = st.slider("5일 누적 상승률 하한 (%)", 0, 30, 7)
-        top_amount_pct = st.slider("거래대금 상위 비율 (%)", 10, 50, 30, step=5)
+        top_amount_pct = st.slider("거래대금 상위 비율 (%)", 5, 50, 20, step=5)
     with col2:
         vol_mult_20d = st.slider("20일 평균 거래량 대비 배수", 1.0, 5.0, 2.0, step=0.1)
         vol_mult_prev = st.slider("전일 거래량 대비 배수", 1.0, 3.0, 1.5, step=0.1)
     with col3:
         min_market_cap = st.number_input("시총 하한 (억원)", 500, 10000, 2000, step=500)
         min_daily_return = st.slider("당일 등락률 하한 (%)", -5.0, 2.0, -2.0, step=0.5)
+        max_scan_count = st.number_input("최대 상세 조회 종목 수", 50, 300, 150, step=25,
+                                         help="응답 속도를 위해 거래대금 상위 종목 중 이 수만 최근 시세를 조회합니다.")
 
     if st.button("주도 후보군 스크리닝 실행", type="primary"):
         with st.spinner("KRX 종목 스캔 및 20일 거래량·수익률 검증 중..."):
@@ -720,14 +772,19 @@ with tab1:
                     df_krx = df_krx.drop_duplicates(subset=['Code']).reset_index(drop=True)
                     df_cap_filtered = df_krx[df_krx['Marcap'] >= (min_market_cap * 100000000)].copy()
                     df_cap_filtered = df_cap_filtered.sort_values(by="Amount", ascending=False)
-                    top_count = max(10, int(len(df_cap_filtered) * (top_amount_pct / 100)))
+                    percent_count = max(10, int(len(df_cap_filtered) * (top_amount_pct / 100)))
+                    top_count = min(percent_count, int(max_scan_count))
                     df_target_pool = df_cap_filtered.head(top_count)
                     
                     screened_stocks = []
-                    seen_codes = set()
                     fail_count = 0
                     error_samples = []
-                    start_check_date = (datetime.datetime.today() - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
+                    scan_date = datetime.date.today().isoformat()
+                    candidate_codes = tuple(df_target_pool['Code'].astype(str).str.zfill(6).tolist())
+
+                    # 첫 실행은 최대 8개 동시 조회, 동일 대상·날짜의 재실행은 캐시 사용
+                    metrics_rows = load_screening_metrics_batch(candidate_codes, scan_date)
+                    metrics_by_code = {item['code']: item for item in metrics_rows}
                     
                     progress_bar = st.progress(0)
                     total_len = len(df_target_pool)
@@ -736,59 +793,32 @@ with tab1:
                         progress_bar.progress((idx + 1) / total_len)
                         code = str(row['Code']).zfill(6)
                         name = row['Name']
-                        
-                        if code in seen_codes:
-                            continue
-
-                        try:
-                            hist = fdr.DataReader(code, start_check_date)
-                            if hist is None or len(hist) < 25:
-                                fail_count += 1
-                                continue
-                            
-                            last_close = hist['Close'].iloc[-1]
-                            prev_close = hist['Close'].iloc[-2]
-                            close_5d = hist['Close'].iloc[-6]
-                            
-                            if prev_close <= 0 or close_5d <= 0:
-                                fail_count += 1
-                                continue
-
-                            return_1d = ((last_close - prev_close) / prev_close) * 100
-                            return_5d = ((last_close - close_5d) / close_5d) * 100
-                            
-                            last_vol = hist['Volume'].iloc[-1]
-                            prev_vol = hist['Volume'].iloc[-2] if hist['Volume'].iloc[-2] > 0 else 1
-                            avg_vol_20d = hist['Volume'].iloc[-21:-1].mean()
-                            if pd.isna(avg_vol_20d) or avg_vol_20d <= 0: avg_vol_20d = 1
-                                
-                            vol_ratio_20d = last_vol / avg_vol_20d
-                            vol_ratio_prev = last_vol / prev_vol
-                            cap_val = int(row['Marcap'] / 100000000)
-                            amount_val = int(row['Amount'] / 100000000)
-
-                            if (return_5d >= min_return_5d and 
-                                vol_ratio_20d >= vol_mult_20d and 
-                                vol_ratio_prev >= vol_mult_prev and 
-                                return_1d >= min_daily_return):
-                                
-                                seen_codes.add(code)
-                                screened_stocks.append({
-                                    "코드": code, "종목명": name, "현재가": int(last_close),
-                                    "당일등락(%)": round(return_1d, 2), "5일수익률(%)": round(return_5d, 2),
-                                    "20일평균대비(배)": round(vol_ratio_20d, 2), "시가총액(억)": cap_val, "거래대금(억)": amount_val
-                                })
-                        except Exception as e:
+                        metrics = metrics_by_code.get(code)
+                        if not metrics or not metrics['ok']:
                             fail_count += 1
                             if len(error_samples) < 3:
-                                error_samples.append(f"{name}({code}): {str(e)}")
+                                detail = metrics.get('error', '조회 결과 없음') if metrics else '조회 결과 없음'
+                                error_samples.append(f"{name}({code}): {detail}")
                             continue
+
+                        if (metrics['return_5d'] >= min_return_5d and
+                            metrics['vol_ratio_20d'] >= vol_mult_20d and
+                            metrics['vol_ratio_prev'] >= vol_mult_prev and
+                            metrics['return_1d'] >= min_daily_return):
+                            screened_stocks.append({
+                                "코드": code, "종목명": name, "현재가": int(metrics['last_close']),
+                                "당일등락(%)": round(metrics['return_1d'], 2),
+                                "5일수익률(%)": round(metrics['return_5d'], 2),
+                                "20일평균대비(배)": round(metrics['vol_ratio_20d'], 2),
+                                "시가총액(억)": int(row['Marcap'] / 100000000),
+                                "거래대금(억)": int(row['Amount'] / 100000000)
+                            })
                     
                     progress_bar.empty()
                     res_df = pd.DataFrame(screened_stocks)
                     st.session_state["screened_df"] = res_df
                     if not res_df.empty:
-                        msg = f"필터링 완료! 주도 후보군 발굴: **{len(res_df)}개** (데이터 원천: {data_source}, 초기 풀: {len(df_krx)}종목)"
+                        msg = f"필터링 완료! 주도 후보군 발굴: **{len(res_df)}개** (데이터 원천: {data_source}, 초기 풀: {len(df_krx)}종목, 상세 조회: {len(df_target_pool)}종목)"
                         if fail_count > 0:
                             msg += f" [제외/데이터 부족: {fail_count}건]"
                         st.success(msg)
