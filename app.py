@@ -6,27 +6,39 @@ import requests
 import io
 import time
 import math
-import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 from bs4 import BeautifulSoup
 import FinanceDataReader as fdr
 from google import genai
 
 # =============================================================
-# [API 및 모델 설정]
+# [시스템 로깅 & 환경 설정]
 # =============================================================
-DEFAULT_API_KEY = "여기에_AQ로_시작하는_키를_붙여넣으세요"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("QuantExecutionFinal")
+
 MODEL_CANDIDATES = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
 
-# -------------------------------------------------------------
-# 0. UI 설정 및 API Key 로드 (키가 없어도 기본 기능 가동)
-# -------------------------------------------------------------
+# 2023년 개정 KRX 공식 호가 단위 (p <= threshold 기준)
+KOREA_TICK_TABLE = [
+    (2000, 1),
+    (5000, 5),
+    (20000, 10),
+    (50000, 20),
+    (200000, 100),
+    (500000, 200),
+    (float('inf'), 1000)
+]
+
 st.set_page_config(
-    page_title="종목 검색기 & 퀀트 실행 시스템 (QUANT - EXECUTION)",
-    page_icon="📈",
+    page_title="QUANT-EXECUTION PRO MAX: 완전 일치 실행 엔진",
+    page_icon="⚖️",
     layout="wide"
 )
 
+# -------------------------------------------------------------
+# 0. API 설정 & AI 설명 데스크
+# -------------------------------------------------------------
 secret_key = ""
 try:
     if "GEMINI_API_KEY" in st.secrets:
@@ -34,987 +46,1185 @@ try:
 except Exception:
     pass
 
-st.sidebar.header("🔑 Gemini API 설정")
-input_key = st.sidebar.text_input(
-    "API Key (자동 로드됨)",
-    value=secret_key if secret_key else ("" if "여기에" in DEFAULT_API_KEY else DEFAULT_API_KEY),
-    type="password",
-    key="gemini_api_key_input",
-    help="AI 분석 브리핑 기능을 이용할 때 필요합니다."
-)
-
-active_key = input_key.strip() if input_key.strip() else (secret_key if secret_key else (DEFAULT_API_KEY if "여기에" not in DEFAULT_API_KEY else ""))
+st.sidebar.header("⚙️ 시스템 설정")
+input_key = st.sidebar.text_input("Gemini API Key", value=secret_key, type="password")
+active_key = input_key.strip() if input_key.strip() else secret_key
 
 client = None
 if active_key:
     try:
         client = genai.Client(api_key=active_key)
-        st.sidebar.success("✅ API 키 인증 완료")
+        st.sidebar.success("✅ AI 리스크 설명 데스크 활성화")
     except Exception as e:
-        st.sidebar.error(f"API 클라이언트 초기화 오류: {e}")
-else:
-    st.sidebar.info("💡 AI 브리핑 기능을 쓰시려면 API 키를 입력해 주세요. (기본 퀀트/스크리너는 키 없이 사용 가능)")
+        client = None
+        st.sidebar.warning(f"AI 비활성화 (순수 규칙 엔진만 가동): {e}")
+
+def generate_ai_briefing(client, prompt):
+    if not client: return ""
+    for model_name in MODEL_CANDIDATES:
+        try:
+            res = client.models.generate_content(model=model_name, contents=prompt)
+            if res and res.text: return res.text
+        except Exception:
+            continue
+    return "AI 브리핑을 생성할 수 없습니다."
 
 # -------------------------------------------------------------
-# [보조 유틸] 국내 주식 호가 단위 세분화 (예외 방어 적용)
+# 1. 호가 단위 및 가격 헬퍼
 # -------------------------------------------------------------
 def get_tick_size(price):
     try:
-        if price is None or pd.isna(price): return 1
         p = abs(float(price))
+        for threshold, tick in KOREA_TICK_TABLE:
+            if p <= threshold:
+                return tick
     except (ValueError, TypeError):
         return 1
-    if p < 2000: return 1
-    elif p < 5000: return 5
-    elif p < 20000: return 10
-    elif p < 50000: return 50
-    elif p < 200000: return 100
-    elif p < 500000: return 500
-    else: return 1000
+    return 1000
 
 def floor_to_tick(price):
-    try:
-        if price is None or pd.isna(price) or float(price) <= 0: return 0
-        p = float(price)
-        t = get_tick_size(p)
-        return int(math.floor(p / t) * t)
-    except (ValueError, TypeError):
-        return 0
+    if price is None or pd.isna(price) or float(price) <= 0: return 0
+    p = float(price)
+    t = get_tick_size(p)
+    return int(math.floor(p / t) * t)
 
 def ceil_to_tick(price):
-    try:
-        if price is None or pd.isna(price) or float(price) <= 0: return 0
-        p = float(price)
-        t = get_tick_size(p)
-        return int(math.ceil(p / t) * t)
-    except (ValueError, TypeError):
-        return 0
-
-def round_to_tick(price):
-    try:
-        if price is None or pd.isna(price) or float(price) <= 0: return 0
-        p = float(price)
-        t = get_tick_size(p)
-        return int(round(p / t) * t)
-    except (ValueError, TypeError):
-        return 0
+    if price is None or pd.isna(price) or float(price) <= 0: return 0
+    p = float(price)
+    t = get_tick_size(p)
+    return int(math.ceil(p / t) * t)
 
 # -------------------------------------------------------------
-# [안전 호출 함수] Gemini SDK
+# 2. 보조 지표 계산 함수군 (Wilder ATR & 거래대금 정제)
 # -------------------------------------------------------------
-def get_live_models(_client):
-    preferred = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
+def calculate_wilder_atr(df, period=14):
+    if len(df) < period + 1: return 0.0
+    high, low, close_prev = df['High'], df['Low'], df['Close'].shift(1)
+    tr = pd.concat([high - low, (high - close_prev).abs(), (low - close_prev).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1.0/period, min_periods=period, adjust=False).mean().iloc[-1]
+    return float(atr) if pd.notna(atr) else 0.0
+
+def get_clean_avg_volume(volume_series, lookback=20):
+    past_vols = volume_series.iloc[-(lookback * 2 + 1):-1]
+    valid_vols = past_vols[past_vols > 0]
+    if len(valid_vols) >= lookback:
+        return float(valid_vols.tail(lookback).mean())
+    elif len(valid_vols) > 0:
+        return float(valid_vols.mean())
+    return 1.0
+
+def get_clean_avg_amount(df_slice, lookback=20):
+    """제공된 Amount 컬럼 우선 사용, 부재 시 Close * Volume으로 fallback"""
+    if 'Amount' in df_slice.columns and not df_slice['Amount'].iloc[-lookback*2:-1].isnull().all() and (df_slice['Amount'].iloc[-lookback*2:-1] > 0).any():
+        amt_series = df_slice['Amount'].iloc[-lookback*2:-1]
+    else:
+        amt_series = (df_slice['Close'] * df_slice['Volume']).iloc[-lookback*2:-1]
+    valid_amt = amt_series[amt_series > 0]
+    if len(valid_amt) >= lookback:
+        return float(valid_amt.tail(lookback).mean())
+    elif len(valid_amt) > 0:
+        return float(valid_amt.mean())
+    return 1.0
+
+# -------------------------------------------------------------
+# 3. KOSPI + KOSDAQ 듀얼 과거 Regime 시계열 엔진
+# -------------------------------------------------------------
+@st.cache_data(ttl=3600)
+def load_historical_dual_regime(start_date="2022-01-01"):
     try:
-        live_list = []
-        for m in _client.models.list():
-            actions = getattr(m, 'supported_actions', []) or []
-            if 'generateContent' in actions:
-                clean_name = m.name.replace('models/', '')
-                live_list.append(clean_name)
-        matched = [p for p in preferred if p in live_list]
-        for l in live_list:
-            if l not in matched and "flash" in l:
-                matched.append(l)
-        if matched:
-            return matched
-    except Exception:
-        pass
-    return MODEL_CANDIDATES
+        df_ks = fdr.DataReader('KS11', start_date)
+        df_kq = fdr.DataReader('KQ11', start_date)
+        if df_ks is None or df_kq is None or len(df_ks) < 30:
+            return pd.DataFrame()
 
-def generate_content_with_retry(client, prompt, max_retries=3):
-    last_error = None
-    target_models = get_live_models(client)
-    retry_codes = ["429", "500", "502", "503", "504", "UNAVAILABLE"]
-    for model_name in target_models:
-        for attempt in range(max_retries):
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt
-                )
-                if response and response.text:
-                    return response.text
-                return "⚠️ AI 응답 결과가 비어 있습니다."
-            except Exception as e:
-                err_str = str(e)
-                last_error = err_str
-                if any(code in err_str for code in retry_codes):
-                    time.sleep((attempt + 1) * 2)
-                    continue
-                else:
-                    break
-    raise Exception(f"AI 호출 실패: {last_error}")
+        df_ks.index = pd.to_datetime(df_ks.index).normalize()
+        df_kq.index = pd.to_datetime(df_kq.index).normalize()
+
+        common_idx = df_ks.index.intersection(df_kq.index)
+        df_ks = df_ks.loc[common_idx]
+        df_kq = df_kq.loc[common_idx]
+
+        for df in [df_ks, df_kq]:
+            df['MA20'] = df['Close'].rolling(20).mean()
+            df['Slope'] = ((df['MA20'] - df['MA20'].shift(5)) / df['MA20'].shift(5)) * 100
+
+        regimes = []
+        for idx in range(len(df_ks)):
+            c_ks, m_ks, s_ks = df_ks['Close'].iloc[idx], df_ks['MA20'].iloc[idx], df_ks['Slope'].iloc[idx]
+            c_kq, m_kq, s_kq = df_kq['Close'].iloc[idx], df_kq['MA20'].iloc[idx], df_kq['Slope'].iloc[idx]
+
+            ks_bull = (c_ks >= m_ks) and (s_ks > 0)
+            kq_bull = (c_kq >= m_kq) and (s_kq > 0)
+            ks_bear = (c_ks < m_ks) and (s_ks <= 0)
+            kq_bear = (c_kq < m_kq) and (s_kq <= 0)
+
+            if ks_bear or kq_bear:
+                regimes.append("RISK-OFF")
+            elif ks_bull and kq_bull:
+                regimes.append("FAVORABLE")
+            else:
+                regimes.append("NEUTRAL")
+
+        df_res = pd.DataFrame(index=common_idx)
+        df_res['Regime'] = regimes
+        df_res['KS_Close'] = df_ks['Close']
+        df_res['KQ_Close'] = df_kq['Close']
+        return df_res
+    except Exception as e:
+        logger.error(f"듀얼 Regime 로드 실패: {e}")
+        return pd.DataFrame()
+
+def get_current_dual_regime():
+    df_dual = load_historical_dual_regime((datetime.date.today() - datetime.timedelta(days=90)).strftime('%Y-%m-%d'))
+    if df_dual.empty:
+        return {"status": "NEUTRAL", "code": "NEUTRAL", "multiplier": 0.5, "msg": "시장 지수 수신 지연"}
+    
+    last = df_dual.iloc[-1]
+    regime = last['Regime']
+    if regime == "FAVORABLE":
+        return {"status": "FAVORABLE (양대 지수 우호)", "code": "FAVORABLE", "multiplier": 1.0, "msg": "KOSPI/KOSDAQ 20일선 상회 및 상승세. 정상 매수 집행."}
+    elif regime == "RISK-OFF":
+        return {"status": "RISK-OFF (시장 위험 경보)", "code": "RISK-OFF", "multiplier": 0.0, "msg": "주요 지수 20일선 하회 및 하락세. 신규 매수를 전면 금지합니다."}
+    else:
+        return {"status": "NEUTRAL (경계/혼조 국면)", "code": "NEUTRAL", "multiplier": 0.5, "msg": "양대 시장 혼조세. 신규 매수 시 비중을 50%로 축소 집행합니다."}
 
 # -------------------------------------------------------------
-# [전종목 마스터 로더] 한국거래소 KIND 공식 상장법인
+# 4. 데이터 로더 & 종목 매핑
 # -------------------------------------------------------------
 @st.cache_data(ttl=86400)
 def load_all_krx_master():
     try:
         url = "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        res = requests.get(url, headers=headers, timeout=6)
+        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
         if res.status_code == 200:
             dfs = pd.read_html(io.BytesIO(res.content), encoding="cp949")
             if dfs and not dfs[0].empty:
                 df = dfs[0][['회사명', '종목코드']].copy()
                 df.columns = ['Name', 'Code']
                 df['Code'] = df['Code'].astype(str).str.zfill(6)
-                df = df.drop_duplicates(subset=['Code']).drop_duplicates(subset=['Name']).reset_index(drop=True)
-                return df
-    except Exception:
-        pass
+                return df.drop_duplicates(subset=['Code']).reset_index(drop=True)
+    except Exception as e:
+        logger.error(f"KIND 로드 실패: {e}")
     return pd.DataFrame()
 
-# -------------------------------------------------------------
-# [데이터 로더] KRX 상장주식 (P0/P1 버그 해결: 동적 헤더 매핑 및 시세 검증)
-# -------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def load_krx_listing():
-    # 1. FinanceDataReader 시도 (시세 필수 열 엄격 검증)
     try:
         df = fdr.StockListing('KRX')
-        if df is not None and not df.empty and 'Code' in df.columns and 'Name' in df.columns:
-            req_market_cols = ['Close', 'Volume', 'Marcap']
-            # 필수 열이 존재하고, 전량 0 또는 NaN이 아닌 유효 데이터인지 확인
-            if all(c in df.columns for c in req_market_cols):
-                has_valid_close = not (df['Close'].fillna(0) <= 0).all()
-                has_valid_marcap = not (df['Marcap'].fillna(0) <= 0).all()
-                if has_valid_close and has_valid_marcap:
-                    df['Code'] = df['Code'].astype(str).str.zfill(6)
-                    if 'Amount' not in df.columns or df['Amount'].isnull().all() or (df['Amount'].fillna(0) == 0).all():
-                        df['Amount'] = df['Close'].fillna(0) * df['Volume'].fillna(0)
-                    else:
-                        df['Amount'] = df['Amount'].fillna(df['Close'].fillna(0) * df['Volume'].fillna(0))
-                    
-                    df = df.drop_duplicates(subset=['Code']).reset_index(drop=True)
-                    df['DataSource'] = 'FinanceDataReader'
-                    return df
-    except Exception:
-        pass
-
-    # 2. 네이버 시가총액 백업 크롤러 (동적 헤더 인덱스 매핑)
-    try:
-        items = []
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        for sosok in [0, 1]:  # 0: 코스피, 1: 코스닥
-            for page in range(1, 35):
-                url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
-                res = requests.get(url, headers=headers, timeout=5)
-                if res.status_code != 200:
-                    break
-                soup = BeautifulSoup(res.content.decode('cp949', errors='ignore'), 'html.parser')
-                table = soup.select_one('table.type_2')
-                if not table:
-                    break
-                
-                # thead에서 열 위치 동적 파악
-                th_elements = table.select('thead th')
-                col_map = {th.text.strip(): i for i, th in enumerate(th_elements)}
-                
-                price_idx = col_map.get('현재가')
-                marcap_idx = col_map.get('시가총액')
-                vol_idx = col_map.get('거래량')
-                
-                if price_idx is None or marcap_idx is None or vol_idx is None:
-                    break
-
-                rows = table.select('tbody tr')
-                found_valid = False
-                for tr in rows:
-                    a_tag = tr.select_one('a.tltle')
-                    if not a_tag:
-                        continue
-                    name = a_tag.text.strip()
-                    href = a_tag.get('href', '')
-                    if 'code=' not in href:
-                        continue
-                    code = href.split('code=')[-1].split('&')[0].strip().zfill(6)
-                    
-                    tds = tr.select('td')
-                    max_idx = max(price_idx, marcap_idx, vol_idx)
-                    if len(tds) <= max_idx:
-                        continue
-                    try:
-                        price_val = float(tds[price_idx].text.strip().replace(',', ''))
-                        marcap_val = float(tds[marcap_idx].text.strip().replace(',', '')) * 100_000_000
-                        vol_val = float(tds[vol_idx].text.strip().replace(',', ''))
-                        
-                        if price_val > 0 and marcap_val > 0:
-                            items.append({
-                                'Code': code,
-                                'Name': name,
-                                'Close': price_val,
-                                'Marcap': marcap_val,
-                                'Volume': vol_val,
-                                'Amount': price_val * vol_val
-                            })
-                            found_valid = True
-                    except Exception:
-                        continue
-                if not found_valid:
-                    break
-
-        if items:
-            df_res = pd.DataFrame(items)
-            df_res = df_res.drop_duplicates(subset=['Code']).reset_index(drop=True)
-            df_res['DataSource'] = '네이버 금융 백업'
-            return df_res
-    except Exception:
-        pass
-
+        if df is not None and not df.empty and 'Code' in df.columns:
+            df['Code'] = df['Code'].astype(str).str.zfill(6)
+            if 'Amount' not in df.columns or df['Amount'].isnull().all():
+                df['Amount'] = df['Close'].fillna(0) * df['Volume'].fillna(0)
+            return df.drop_duplicates(subset=['Code']).reset_index(drop=True)
+    except Exception as e:
+        logger.error(f"KRX 로드 실패: {e}")
     return pd.DataFrame()
 
-# -------------------------------------------------------------
-# [스크리너 성능] 최근 시세 지표를 제한 병렬 조회하고 1시간 캐시
-# -------------------------------------------------------------
-def _get_screening_metrics(code, start_date):
-    """Streamlit UI와 분리된 단일 종목 조회 함수."""
-    try:
-        hist = fdr.DataReader(code, start_date)
-        required_cols = ['Close', 'Volume']
-        if hist is None or len(hist) < 25 or not all(c in hist.columns for c in required_cols):
-            return {"code": code, "ok": False, "error": "최근 OHLCV 데이터 부족"}
-
-        last_close = hist['Close'].iloc[-1]
-        prev_close = hist['Close'].iloc[-2]
-        close_5d = hist['Close'].iloc[-6]
-        last_vol = hist['Volume'].iloc[-1]
-        prev_vol = hist['Volume'].iloc[-2]
-        avg_vol_20d = hist['Volume'].iloc[-21:-1].mean()
-
-        values = [last_close, prev_close, close_5d, last_vol, prev_vol, avg_vol_20d]
-        if any(pd.isna(v) for v in values) or prev_close <= 0 or close_5d <= 0 or last_vol < 0:
-            return {"code": code, "ok": False, "error": "가격 또는 거래량 결측/비정상"}
-
-        return {
-            "code": code,
-            "ok": True,
-            "last_close": float(last_close),
-            "return_1d": (last_close - prev_close) / prev_close * 100,
-            "return_5d": (last_close - close_5d) / close_5d * 100,
-            "vol_ratio_20d": last_vol / max(avg_vol_20d, 1),
-            "vol_ratio_prev": last_vol / max(prev_vol, 1),
-        }
-    except Exception as e:
-        return {"code": code, "ok": False, "error": str(e)}
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_screening_metrics_batch(codes, scan_date):
-    """같은 날짜·대상 풀은 재실행 시 네트워크 호출 없이 재사용한다."""
-    start_date = (datetime.datetime.fromisoformat(scan_date) - datetime.timedelta(days=60)).strftime("%Y-%m-%d")
-    workers = min(8, len(codes))
-    if workers == 0:
-        return []
-
-    results = []
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(_get_screening_metrics, code, start_date) for code in codes]
-        for future in as_completed(futures):
-            results.append(future.result())
-    return results
-
-# -------------------------------------------------------------
-# [안전 종목 검색 함수]
-# -------------------------------------------------------------
-def find_stock_code(target_stock, df_krx):
-    query = target_stock.strip()
-    if not query:
-        return None, None
-
-    # 1. 6자리 종목코드 직접 입력
+def find_stock_code(query, df_krx):
+    query = query.strip()
+    if not query: return None, None
     if query.isdigit() and len(query) == 6:
-        code = query
-        name = query
         master = load_all_krx_master()
         if not master.empty:
-            m = master[master['Code'] == code]
-            if not m.empty:
-                name = m.iloc[0]['Name']
-        return code, name
+            m = master[master['Code'] == query]
+            if not m.empty: return query, m.iloc[0]['Name']
+        return query, query
 
-    # 2. KIND 전종목 마스터 매칭
-    query_clean = query.upper().replace(" ", "")
     master = load_all_krx_master()
     if not master.empty:
-        names_clean = master['Name'].astype(str).str.upper().str.replace(" ", "")
-        matched = master[names_clean == query_clean]
-        if not matched.empty:
-            return matched.iloc[0]['Code'], matched.iloc[0]['Name']
+        matched = master[master['Name'].astype(str).str.upper().str.replace(" ", "") == query.upper().replace(" ", "")]
+        if not matched.empty: return matched.iloc[0]['Code'], matched.iloc[0]['Name']
 
-    # 3. df_krx 내 대조
-    if df_krx is not None and not df_krx.empty and 'Name' in df_krx.columns:
-        names_clean = df_krx['Name'].astype(str).str.upper().str.replace(" ", "")
-        matched = df_krx[names_clean == query_clean]
-        if not matched.empty:
-            return matched.iloc[0]['Code'], matched.iloc[0]['Name']
-
-    # 4. 네이버 공식 자동완성 백업
-    try:
-        url_ac = f"https://ac.finance.naver.com/ac?q={urllib.parse.quote(query)}&st=1&r_format=json&r_enc=utf-8"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://finance.naver.com/"
-        }
-        r = requests.get(url_ac, headers=headers, timeout=3)
-        if r.status_code == 200:
-            data = r.json()
-            items = data.get('items', [])
-            if items and len(items[0]) > 0:
-                first = items[0][0]
-                return str(first[0]).strip().zfill(6), str(first[1]).strip()
-    except Exception:
-        pass
-
+    if df_krx is not None and not df_krx.empty:
+        matched = df_krx[df_krx['Name'].astype(str).str.upper().str.replace(" ", "") == query.upper().replace(" ", "")]
+        if not matched.empty: return matched.iloc[0]['Code'], matched.iloc[0]['Name']
     return None, None
 
-# -------------------------------------------------------------
-# [보조 함수] 네이버 금융 세부 펀더멘털 & 일별 수급 수집
-# -------------------------------------------------------------
-def get_comprehensive_stock_data(code):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    data = {
-        "per": None, "pbr": None, "frgn_5": 0, "frgn_10": 0, "frgn_20": 0,
-        "inst_5": 0, "inst_10": 0, "inst_20": 0, "data_confidence": "B (수급 미확인)"
-    }
-    
-    # 1. 수급 데이터 수집
+def get_supply_data(code):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    res_data = {"frgn_5": 0, "inst_5": 0, "status": "FAIL"}
     try:
-        url_sise = f"https://finance.naver.com/item/frgn.naver?code={code}"
-        res = requests.get(url_sise, headers=headers, timeout=5)
+        url = f"https://finance.naver.com/item/frgn.naver?code={code}"
+        res = requests.get(url, headers=headers, timeout=4)
         if res.status_code == 200:
             dfs = pd.read_html(io.BytesIO(res.content), encoding="cp949")
-            df_frgn = None
-            for t in dfs:
-                cols_str = str(t.columns)
-                if "기관" in cols_str and "외국인" in cols_str:
-                    df_frgn = t
-                    break
+            df_frgn = next((t for t in dfs if "기관" in str(t.columns) and "외국인" in str(t.columns)), None)
             if df_frgn is not None:
-                df_frgn.columns = ['_'.join(col).strip() if isinstance(col, tuple) else str(col) for col in df_frgn.columns]
-                df_frgn = df_frgn.dropna(subset=[df_frgn.columns[0]])
-                
-                inst_cols = [c for c in df_frgn.columns if "기관" in c and "순매" in c]
-                frgn_cols = [c for c in df_frgn.columns if "외국인" in c and "순매" in c]
-                
-                if inst_cols and frgn_cols:
-                    inst_vals = pd.to_numeric(df_frgn[inst_cols[0]].astype(str).str.replace(',', ''), errors='coerce').fillna(0).tolist()
-                    frgn_vals = pd.to_numeric(df_frgn[frgn_cols[0]].astype(str).str.replace(',', ''), errors='coerce').fillna(0).tolist()
-                    
-                    data["frgn_5"] = int(sum(frgn_vals[:5]))
-                    data["frgn_10"] = int(sum(frgn_vals[:10]))
-                    data["frgn_20"] = int(sum(frgn_vals[:20]))
-                    data["inst_5"] = int(sum(inst_vals[:5]))
-                    data["inst_10"] = int(sum(inst_vals[:10]))
-                    data["inst_20"] = int(sum(inst_vals[:20]))
-                    data["data_confidence"] = "A"
-    except Exception:
-        data["data_confidence"] = "B (수급 미확인)"
-
-    # 2. 재무 밸류에이션 수집
-    try:
-        url_main = f"https://finance.naver.com/item/main.naver?code={code}"
-        res_main = requests.get(url_main, headers=headers, timeout=5)
-        if res_main.status_code == 200:
-            soup = BeautifulSoup(res_main.content.decode('cp949', errors='ignore'), 'html.parser')
-            per_tag = soup.select_one('#_per')
-            pbr_tag = soup.select_one('#_pbr')
-            if per_tag:
-                t_val = per_tag.text.strip().replace(',', '')
-                try: data["per"] = float(t_val)
-                except ValueError: data["per"] = None
-            if pbr_tag:
-                b_val = pbr_tag.text.strip().replace(',', '')
-                try: data["pbr"] = float(b_val)
-                except ValueError: data["pbr"] = None
+                df_frgn.columns = ['_'.join(c).strip() if isinstance(c, tuple) else str(c) for c in df_frgn.columns]
+                i_cols = [c for c in df_frgn.columns if "기관" in c and "순매" in c]
+                f_cols = [c for c in df_frgn.columns if "외국인" in c and "순매" in c]
+                if i_cols and f_cols:
+                    iv = pd.to_numeric(df_frgn[i_cols[0]].astype(str).str.replace(',', ''), errors='coerce').dropna().tolist()
+                    fv = pd.to_numeric(df_frgn[f_cols[0]].astype(str).str.replace(',', ''), errors='coerce').dropna().tolist()
+                    if len(iv) >= 5 and len(fv) >= 5:
+                        res_data["inst_5"] = int(sum(iv[:5]))
+                        res_data["frgn_5"] = int(sum(fv[:5]))
+                        res_data["status"] = "OK"
     except Exception:
         pass
-
-    return data
-
-# -------------------------------------------------------------
-# [보조 함수] Wilder's Smoothing RSI 및 표준 구간 해석기
-# -------------------------------------------------------------
-def calculate_wilder_rsi(series, period=14):
-    if len(series) < period + 2:
-        return 50.0
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    
-    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean().iloc[-1]
-    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean().iloc[-1]
-    
-    if pd.isna(avg_gain) or pd.isna(avg_loss) or (avg_gain == 0 and avg_loss == 0):
-        return 50.0
-    if avg_loss == 0:
-        return 100.0
-    if avg_gain == 0:
-        return 0.0
-        
-    rs = avg_gain / avg_loss
-    return round(float(100.0 - (100.0 / (1.0 + rs))), 1)
-
-def get_rsi_status(rsi):
-    if pd.isna(rsi):
-        return "산출 불가"
-    if rsi < 30:
-        return "과매도"
-    elif rsi < 50:
-        return "약세 / 중립"
-    elif rsi < 60:
-        return "상승 모멘텀"
-    elif rsi < 70:
-        return "강세 / 과열 경계"
-    elif rsi < 80:
-        return "과열"
-    else:
-        return "극단적 과열"
+    return res_data
 
 # -------------------------------------------------------------
-# [QUAD-MATRIX 퀀트 실행 엔진]
+# 5. [100점 Entry Score] 상대강도 인덱스 보정 엔진
 # -------------------------------------------------------------
-def run_quad_execution_engine(df_hist, extra_data):
-    curr_price = int(df_hist['Close'].iloc[-1])
-    prev_close = int(df_hist['Close'].iloc[-2])
-    today_open = int(df_hist['Open'].iloc[-1])
-    today_low = int(df_hist['Low'].iloc[-1])
-    
-    ma5 = df_hist['Close'].rolling(5).mean().iloc[-1]
-    ma20 = df_hist['Close'].rolling(20).mean().iloc[-1]
-    ma60 = df_hist['Close'].rolling(60).mean().iloc[-1] if len(df_hist) >= 60 else np.nan
-    ma120 = df_hist['Close'].rolling(120).mean().iloc[-1] if len(df_hist) >= 120 else np.nan
-    
-    # 20일 전고점: 직전 20거래일 (당일 봉 제외)
-    high_20 = int(df_hist['High'].iloc[-21:-1].max())
-    low_20 = int(df_hist['Low'].iloc[-21:-1].min())
+def calculate_100p_score(df_slice, kospi_slice=None, has_frgn=False):
+    if len(df_slice) < 25:
+        return {"score": 0, "grade": "AVOID", "details": {}, "track": "WAIT"}
 
-    high_52w = int(df_hist['High'].max())
-    if high_52w <= 0: high_52w = curr_price
-    
-    # Wilder RSI
-    rsi_14 = calculate_wilder_rsi(df_hist['Close'], period=14)
-    rsi_desc = get_rsi_status(rsi_14)
-    
-    # 이격도 vs 이격률
-    if pd.notna(ma20) and ma20 > 0:
-        disparity_ratio = round((curr_price / ma20) * 100, 1)
-        disparity_pct = round(((curr_price - ma20) / ma20) * 100, 1)
-        disp_display_str = f"{disparity_ratio}% ({'+' if disparity_pct > 0 else ''}{disparity_pct}%)"
-    else:
-        disparity_ratio = 100.0
-        disparity_pct = 0.0
-        disp_display_str = "100.0% (+0.0%)"
-    
-    vol_last = df_hist['Volume'].iloc[-1]
-    avg_vol_20d = df_hist['Volume'].iloc[-21:-1].mean()
-    if pd.isna(avg_vol_20d) or avg_vol_20d <= 0: avg_vol_20d = 1
-    vol_ratio_20d = round(float(vol_last / avg_vol_20d), 2)
+    curr_p = float(df_slice['Close'].iloc[-1])
+    open_p = float(df_slice['Open'].iloc[-1])
+    high_p = float(df_slice['High'].iloc[-1])
+    low_p = float(df_slice['Low'].iloc[-1])
 
-    # =========================================================
-    # ① QUALITY (0~100점 정규화)
-    # =========================================================
-    s_val = 10
-    per, pbr = extra_data.get('per'), extra_data.get('pbr')
-    if per is not None:
-        if 0 < per <= 15: s_val += 6
-        elif 15 < per <= 30: s_val += 3
-        elif per > 50: s_val -= 4
-    if pbr is not None:
-        if 0 < pbr <= 1.5: s_val += 4
-        elif pbr > 4.0: s_val -= 2
-    score_val = max(min(s_val, 20), 2)
+    ma5 = float(df_slice['Close'].rolling(5).mean().iloc[-1])
+    ma20 = float(df_slice['Close'].rolling(20).mean().iloc[-1])
+    ma20_5d = float(df_slice['Close'].rolling(20).mean().iloc[-6])
+    ma60 = float(df_slice['Close'].rolling(60).mean().iloc[-1]) if len(df_slice) >= 60 else ma20
 
-    if extra_data['data_confidence'] == "A":
-        f20, f5 = extra_data['frgn_20'], extra_data['frgn_5']
-        i20, i5 = extra_data['inst_20'], extra_data['inst_5']
-        s_frgn = 7 + (4 if f20 > 0 else 0) + (3 if f5 > 0 else (-2 if f20 > 0 else 0))
-        s_inst = 5 + (3 if i20 > 0 else 0) + (2 if i5 > 0 else 0)
-        score_supply = min(s_frgn + s_inst, 25)
-    else:
-        score_supply = 10
+    ma20_slope_pct = ((ma20 - ma20_5d) / ma20_5d) * 100 if ma20_5d > 0 else 0.0
+    disparity_pct = ((curr_p - ma20) / ma20) * 100
 
-    if pd.notna(ma60):
-        s_trend = 15 if curr_price >= ma5 >= ma20 >= ma60 else (10 if curr_price >= ma20 >= ma60 else 5)
-    else:
-        s_trend = 12 if curr_price >= ma5 >= ma20 else 6
-    drop_from_52w = (high_52w - curr_price) / high_52w * 100
-    s_high = 10 if drop_from_52w <= 5 else (7 if drop_from_52w <= 15 else (4 if drop_from_52w <= 30 else 2))
-    score_trend = min(s_trend + s_high, 25)
+    score = 0
+    details = {}
 
-    score_mom = 12 if vol_ratio_20d >= 2.0 else (8 if vol_ratio_20d >= 1.2 else 4)
-    if curr_price > prev_close: score_mom += 8
+    # 1. 추세 구조 (20점)
+    trend_pts = 0
+    if curr_p >= ma20 >= ma60: trend_pts += 12
+    elif curr_p >= ma20: trend_pts += 8
+    if ma20_slope_pct > 0.3: trend_pts += 8
+    elif ma20_slope_pct > 0: trend_pts += 5
+    score += trend_pts
+    details["추세구조"] = f"{trend_pts}/20"
 
-    score_margin = 10 if abs(disparity_pct) <= 3.0 else (6 if abs(disparity_pct) <= 6.0 else 2)
+    # 2. MA20 지지/이격 (20점)
+    disp_pts = 0
+    if -1.0 <= disparity_pct <= 2.5: disp_pts += 20
+    elif 2.5 < disparity_pct <= 5.0: disp_pts += 12
+    elif -2.5 <= disparity_pct < -1.0: disp_pts += 8
+    score += disp_pts
+    details["MA20지지"] = f"{disp_pts}/20"
 
-    quality_score = score_val + score_supply + score_trend + score_mom + score_margin
+    # 3. 모멘텀 & 캔들 장악력 (15점)
+    c_pts = 0
+    c_range = (high_p - low_p) if high_p > low_p else 1.0
+    c_pos = (curr_p - low_p) / c_range
+    if curr_p > open_p and c_pos >= 0.65: c_pts += 10
+    elif curr_p > open_p: c_pts += 5
+    if curr_p >= ma5: c_pts += 5
+    score += c_pts
+    details["모멘텀캔들"] = f"{c_pts}/15"
 
-    # =========================================================
-    # ② TIMING (0~100점)
-    # =========================================================
-    pullback_min = floor_to_tick(ma20 * 0.99)
-    pullback_max = ceil_to_tick(ma20 * 1.025)
-    entry_ref_price = round_to_tick((pullback_min + pullback_max) / 2)
+    # 4. 거래량 유입 (15점)
+    vol_pts = 0
+    clean_v20 = get_clean_avg_volume(df_slice['Volume'], 20)
+    vol_ratio = float(df_slice['Volume'].iloc[-1] / clean_v20)
+    if vol_ratio >= 1.5: vol_pts += 15
+    elif vol_ratio >= 1.2: vol_pts += 10
+    elif vol_ratio >= 0.9: vol_pts += 5
+    score += vol_pts
+    details["거래량"] = f"{vol_pts}/15"
 
-    timing_val = 50
-    if 99.0 <= disparity_ratio <= 102.5:
-        timing_val += 35
-    elif 102.5 < disparity_ratio <= 105.0:
-        timing_val += 15
-    elif disparity_pct > 7.0:
-        timing_val -= 35
-    elif disparity_ratio < 95.0:
-        timing_val -= 20
-
-    dist_to_resist = (high_20 - curr_price) / curr_price * 100 if curr_price > 0 else 0
-    if 0 < dist_to_resist <= 3.0:
-        timing_val -= 15
-
-    timing_score = max(min(timing_val, 100), 0)
-
-    # =========================================================
-    # ③ RISK (0~100점)
-    # =========================================================
-    risk_val = 10
-    if rsi_14 >= 80: risk_val += 40
-    elif rsi_14 >= 70: risk_val += 25
-    elif rsi_14 >= 60: risk_val += 10
-    
-    if disparity_ratio >= 115: risk_val += 35
-    elif disparity_ratio >= 110: risk_val += 20
-    elif disparity_ratio >= 107: risk_val += 10
-    
-    if 0 < dist_to_resist <= 2.5:
-        risk_val += 15
-    if extra_data['data_confidence'] == "A" and extra_data['frgn_5'] < 0 and extra_data['inst_5'] < 0:
-        risk_val += 10
-    
-    risk_score = max(min(risk_val, 100), 0)
-    if risk_score <= 25:
-        risk_label = "🟢 낮음 (안전)"
-    elif risk_score <= 50:
-        risk_label = "🟡 보통 (관리 가능)"
-    elif risk_score <= 75:
-        risk_label = "🟠 높음 (과열 경계)"
-    else:
-        risk_label = "🔴 극단적 과열 (진입 금지)"
-
-    # =========================================================
-    # ④ TRIGGER (0~100점)
-    # =========================================================
-    in_buy_zone = (pullback_min <= curr_price <= pullback_max)
-    breakout_price = ceil_to_tick(high_20 * 1.005)
-    is_breakout = (curr_price >= breakout_price and vol_ratio_20d >= 1.5 and curr_price > prev_close)
-
-    trig_score = 0
-    if is_breakout:
-        trig_score = 85
-        trigger_state = "🟢 ACTIVE (돌파 진입)"
-        trigger_badge = "ACTIVE"
-        trigger_action = "20일 전고점 돌파 + 거래량 충족 확인 (돌파 추종 유효)"
-    elif in_buy_zone:
-        trig_score = 40
-        cond_count = 0
-        if today_low >= int(ma20 * 0.985) and curr_price >= ma20:
-            trig_score += 15; cond_count += 1
-        if curr_price > today_open:
-            trig_score += 15; cond_count += 1
-        if today_low < prev_close and curr_price > prev_close:
-            trig_score += 10; cond_count += 1
-        if curr_price >= ma5:
-            trig_score += 10; cond_count += 1
-        if vol_ratio_20d >= 1.2 or (extra_data['data_confidence'] == "A" and extra_data['frgn_5'] > 0):
-            trig_score += 10; cond_count += 1
-
-        if cond_count >= 2 or trig_score >= 70:
-            trigger_state = "🟢 ACTIVE (분할 진입)"
-            trigger_badge = "ACTIVE"
-            trigger_action = f"Buy Zone 내 반등 조건 {cond_count}개 충족 (기계적 분할 진입 가동)"
-        elif cond_count == 1 or trig_score >= 50:
-            trigger_state = "🟡 WATCH (조건 확인)"
-            trigger_badge = "WATCH"
-            trigger_action = f"Buy Zone 내 지지 확인 중 (조건 1개 충족, 추가 반등 신호 대기)"
+    # 5. 상대강도 RS (15점) - 정확한 20거래일 전(iloc[-21]) 대비
+    rs_pts = 5
+    if len(df_slice) >= 21:
+        p_prev20 = float(df_slice['Close'].iloc[-21])
+        stk_ret20 = ((curr_p - p_prev20) / p_prev20) * 100
+        if kospi_slice is not None and len(kospi_slice) >= 21:
+            k_curr = float(kospi_slice['Close'].iloc[-1])
+            k_prev20 = float(kospi_slice['Close'].iloc[-21])
+            mkt_ret20 = ((k_curr - k_prev20) / k_prev20) * 100
+            diff_rs = stk_ret20 - mkt_ret20
+            if diff_rs >= 5.0: rs_pts = 15
+            elif diff_rs >= 0.0: rs_pts = 10
+            elif diff_rs >= -5.0: rs_pts = 5
+            else: rs_pts = 0
         else:
-            trigger_state = "🟠 WAIT (대기)"
-            trigger_badge = "WAIT"
-            trigger_action = "Buy Zone 진입했으나 반등 미확인 (떨어지는 칼날 매수 금지)"
-    else:
-        if disparity_pct > 7.0:
-            trig_score = 20
-            trigger_state = "🔴 OFF (진입 금지)"
-            trigger_badge = "OFF"
-            trigger_action = f"20일선 대비 +{disparity_pct:.1f}% 이격 과대 (추격매수 금지 / 눌림목 대기)"
+            if stk_ret20 > 5.0: rs_pts = 12
+    score += rs_pts
+    details["상대강도"] = f"{rs_pts}/15"
+
+    # 6. 전고점 근접 / 수급 참여 (15점)
+    brk_pts = 0
+    high_20 = float(df_slice['High'].iloc[-21:-1].max())
+    dist_high = ((high_20 - curr_p) / curr_p) * 100
+    if dist_high <= 3.0: brk_pts += 10
+    elif dist_high <= 6.0: brk_pts += 5
+    if has_frgn: brk_pts += 5
+    score += min(15, brk_pts)
+    details["돌파수급"] = f"{min(15, brk_pts)}/15"
+
+    # 최종 등급 산출
+    if score >= 82: grade = "STRONG_BUY"
+    elif score >= 70: grade = "BUY"
+    elif score >= 60: grade = "WATCH"
+    elif score >= 50: grade = "WAIT"
+    else: grade = "AVOID"
+
+    # 3-Track 의사결정
+    if grade in ["STRONG_BUY", "BUY"]:
+        if -1.0 <= disparity_pct <= 1.5:
+            track = "MARKET"
+        elif 1.5 < disparity_pct <= 3.5:
+            track = "PULLBACK"
+        elif dist_high <= 2.5 and vol_ratio >= 1.3:
+            track = "BREAKOUT"
         else:
-            trig_score = 45
-            trigger_state = "🟠 WAIT (대기)"
-            trigger_badge = "WAIT"
-            trigger_action = "Buy Zone 또는 돌파 기준선 미도달 (시나리오 관망)"
-
-    # ⑤ 시장 상태 판정
-    if pd.notna(ma60) and curr_price >= ma5 >= ma20 >= ma60:
-        if disparity_pct > 7.0:
-            market_state = "상승 추세 진행 / 현재 추격매수 불리 (눌림목 대기)"
-            state_color = "warning"
-        elif in_buy_zone:
-            market_state = "상승 추세 내 최적 눌림목 구간 (반등 트리거 관찰)"
-            state_color = "success"
-        else:
-            market_state = "상승 추세 유지 (보유선 트레일링 홀딩)"
-            state_color = "info"
-    elif pd.notna(ma60) and curr_price < ma20 and curr_price >= ma60:
-        market_state = "단기 조정 진행 중 (60일선 지지력 테스트)"
-        state_color = "info"
+            track = "MARKET"
     else:
-        market_state = "추세 훼손 또는 하락/비정배열 구간 (진입 보류)"
-        state_color = "error"
-
-    # ⑥ 손절선 설계 (호가 단위 내림 적용)
-    target_entry = entry_ref_price if not in_buy_zone else curr_price
-    stop_short_init = floor_to_tick(ma20 * 0.985)
-    stop_swing_init = floor_to_tick(ma20 * 0.970)
-    stop_mid_init = floor_to_tick(ma60 * 0.970) if pd.notna(ma60) else floor_to_tick(ma20 * 0.950)
-
-    loss_short_pct = round((stop_short_init - target_entry) / target_entry * 100, 1)
-    loss_swing_pct = round((stop_swing_init - target_entry) / target_entry * 100, 1)
-    loss_mid_pct = round((stop_mid_init - target_entry) / target_entry * 100, 1)
-
-    # ⑦ R-Multiple 목표 (손절폭 역전 검증 적용)
-    if target_entry > stop_swing_init and stop_swing_init > 0:
-        risk_unit_R = target_entry - stop_swing_init
-        target_1R_val = ceil_to_tick(target_entry + risk_unit_R)
-        target_2R_val = ceil_to_tick(target_entry + 2 * risk_unit_R)
-        target_3R_val = ceil_to_tick(target_entry + 3 * risk_unit_R)
-
-        r1_pct = round((target_1R_val - target_entry) / target_entry * 100, 1)
-        r2_pct = round((target_2R_val - target_entry) / target_entry * 100, 1)
-        r3_pct = round((target_3R_val - target_entry) / target_entry * 100, 1)
-
-        target_1R_str = f"{target_1R_val:,}원 (+{r1_pct}%)"
-        target_2R_str = f"{target_2R_val:,}원 (+{r2_pct}%)"
-        target_3R_str = f"{target_3R_val:,}원 (+{r3_pct}%)"
-    else:
-        risk_unit_R = 0
-        target_1R_str = "산출 불가 (손절폭 비정상)"
-        target_2R_str = "산출 불가"
-        target_3R_str = "산출 불가"
+        track = "WAIT"
 
     return {
-        "quality_score": quality_score,
-        "timing_score": timing_score,
-        "risk_score": risk_score,
-        "risk_label": risk_label,
-        "trig_score": trig_score,
-        "trigger_state": trigger_state,
-        "trigger_badge": trigger_badge,
-        "trigger_action": trigger_action,
-        "market_state": market_state,
-        "state_color": state_color,
-        "curr_price": curr_price,
-        "target_entry": target_entry,
-        "pullback_min": pullback_min,
-        "pullback_max": pullback_max,
-        "pullback_range": f"{pullback_min:,}원 ~ {pullback_max:,}원",
-        "high_20": high_20,
-        "breakout_price": breakout_price,
-        "high_52w": high_52w,
-        "ma5": int(ma5), "ma20": int(ma20),
-        "ma60": int(ma60) if pd.notna(ma60) else None,
-        "disp_display_str": disp_display_str,
-        "disparity_pct": disparity_pct,
-        "rsi_14": rsi_14,
-        "rsi_desc": rsi_desc,
-        "vol_ratio_20d": vol_ratio_20d,
-        "stop_short_init": f"{stop_short_init:,}원 ({loss_short_pct}%)",
-        "stop_swing_init": f"{stop_swing_init:,}원 ({loss_swing_pct}%)",
-        "stop_mid_init": f"{stop_mid_init:,}원 ({loss_mid_pct}%)" if pd.notna(ma60) else "데이터 부족",
-        "risk_unit_R": risk_unit_R,
-        "target_1R": target_1R_str,
-        "target_2R": target_2R_str,
-        "target_3R": target_3R_str
+        "score": score, "grade": grade, "details": details,
+        "track": track, "disparity_pct": disparity_pct,
+        "high_20": int(high_20), "ma20": int(ma20), "ma20_slope_pct": ma20_slope_pct
     }
 
 # -------------------------------------------------------------
-# UI 대시보드
+# 6. 가격선 설계 & 손절폭 과도 필터
 # -------------------------------------------------------------
-st.title("📈 종목 검색기 & 퀀트 실행 시스템 (QUANT - EXECUTION)")
-st.caption("ARCHITECTURE: 4대 독립 스코어링 (Quad-Matrix) + R-Multiple 익절 + 구조적 손절선")
+def calculate_execution_levels(df_slice, entry_price):
+    atr14 = calculate_wilder_atr(df_slice, 14)
+    curr_p = float(entry_price)
+    ma20 = float(df_slice['Close'].rolling(20).mean().iloc[-1])
+    recent_swing_low = float(df_slice['Low'].iloc[-10:-1].min())
+    high_20 = float(df_slice['High'].iloc[-21:-1].max())
 
-tab1, tab2, tab3 = st.tabs(["STEP 1 · 주도 후보 스크리너", "STEP 2 · 퀀트 실행 분석 (Quad-Matrix)", "📖 시스템 실행 매뉴얼"])
+    stop_atr = curr_p - (1.5 * atr14)
+    stop_struct = recent_swing_low - (0.2 * atr14)
+    stop_trend = ma20 * 0.97
+    candidate_stop = min(stop_atr, stop_struct, stop_trend)
+
+    # 최소 1.2 ATR 거리 보장
+    min_dist_price = curr_p - (1.2 * atr14)
+    final_stop_val = min(candidate_stop, min_dist_price)
+    
+    stop_price = floor_to_tick(final_stop_val)
+    if stop_price >= curr_p:
+        stop_price = floor_to_tick(curr_p * 0.96)
+
+    risk_1r = curr_p - stop_price
+    loss_pct = round(((stop_price - curr_p) / curr_p) * 100, 2)
+    is_excessive_stop = abs(loss_pct) >= 8.5
+
+    target_1r = ceil_to_tick(curr_p + 1.0 * risk_1r)
+    target_2r = ceil_to_tick(curr_p + 2.0 * risk_1r)
+    target_3r = ceil_to_tick(curr_p + 3.0 * risk_1r)
+
+    reward_to_resist = high_20 - curr_p
+    rrr_to_resist = round(reward_to_resist / risk_1r, 2) if risk_1r > 0 else 0.0
+    resistance_warning = None
+    if target_2r > high_20:
+        resistance_warning = f"2R 도달 전 직전 20일 전고점({int(high_20):,}원, 실질 RRR: {rrr_to_resist}R) 매물대 존재"
+
+    return {
+        "entry_price": int(curr_p),
+        "stop_price": stop_price,
+        "loss_pct": loss_pct,
+        "is_excessive_stop": is_excessive_stop,
+        "risk_1r": int(risk_1r),
+        "target_1r": target_1r,
+        "target_2r": target_2r,
+        "target_3r": target_3r,
+        "high_20": int(high_20),
+        "rrr_to_resist": rrr_to_resist,
+        "resistance_warning": resistance_warning,
+        "atr14": int(atr14)
+    }
+
+def evaluate_full_execution_pipeline(df_slice, regime_code, kospi_slice=None, has_frgn=False):
+    scored = calculate_100p_score(df_slice, kospi_slice, has_frgn=has_frgn)
+    curr_p = int(df_slice['Close'].iloc[-1])
+    levels = calculate_execution_levels(df_slice, curr_p)
+
+    if scored["grade"] not in ["STRONG_BUY", "BUY"]:
+        return {"action": "WAIT", "badge": f"🟡 {scored['grade']} ({scored['score']}점)", "reason": "최소 매수 점수(70점) 미달", "scored": scored, "levels": levels, "multiplier": 0.0}
+
+    if levels["is_excessive_stop"]:
+        return {"action": "WAIT", "badge": "🟡 WAIT (손절폭 과도)", "reason": f"지지선 기반 손절폭({levels['loss_pct']}%)이 -8.5%를 초과하여 자본 회전 효율이 낮습니다.", "scored": scored, "levels": levels, "multiplier": 0.0}
+
+    if regime_code == "RISK-OFF":
+        return {"action": "AVOID", "badge": "🔴 AVOID (시장 위험 차단)", "reason": "시장 Regime이 RISK-OFF 국면이므로 모든 신규 매수를 금지합니다.", "scored": scored, "levels": levels, "multiplier": 0.0}
+    elif regime_code == "NEUTRAL":
+        return {"action": "BUY_REDUCED", "badge": f"🟡 BUY (비중 50% 축소 | {scored['score']}점)", "reason": "시장 중립 국면. 자본 리스크 통제를 위해 수량을 50%로 축소 집행합니다.", "scored": scored, "levels": levels, "multiplier": 0.5}
+    else:
+        return {"action": "BUY", "badge": f"🟢 BUY (정상 진입 | {scored['score']}점)", "reason": f"시장 우호 + 100점 만점 통과({scored['score']}점). 정상 진입을 승인합니다.", "scored": scored, "levels": levels, "multiplier": 1.0}
+
+def calculate_position_sizing(account_capital, risk_pct, exec_multiplier, curr_price, risk_1r, atr14, avg_amount_20):
+    effective_risk_pct = (risk_pct / 100.0) * exec_multiplier
+    max_risk_amount = account_capital * effective_risk_pct
+
+    if risk_1r <= 0 or curr_price <= 0 or effective_risk_pct <= 0:
+        return {"shares": 0, "total_invest": 0, "weight_pct": 0.0, "normal_risk_loss": 0, "worst_gap_loss": 0}
+
+    raw_shares = int(max_risk_amount // risk_1r)
+    max_liq_shares = int((avg_amount_20 * 0.01) // curr_price) if avg_amount_20 > 0 else raw_shares
+    max_weight_shares = int((account_capital * 0.30) // curr_price)
+
+    final_shares = max(0, min(raw_shares, max_liq_shares, max_weight_shares))
+    total_invest = final_shares * curr_price
+    weight_pct = round((total_invest / account_capital) * 100, 1)
+
+    normal_risk_loss = final_shares * risk_1r
+    worst_gap_loss = final_shares * (risk_1r + int(1.0 * atr14))
+
+    return {
+        "shares": final_shares, "total_invest": int(total_invest),
+        "weight_pct": weight_pct, "normal_risk_loss": int(normal_risk_loss),
+        "worst_gap_loss": int(worst_gap_loss)
+    }
 
 # -------------------------------------------------------------
-# STEP 1: 수급 테마 검색
+# 7. [공통 코어] 3-Track 진입 판정 & 일중 청산 관리 통합 엔진
+# -------------------------------------------------------------
+def check_3track_execution(track, b_open, b_high, b_low, ma20_entry, high_20):
+    """단일 종목 및 포트폴리오 백테스트에서 100% 동일하게 호출되는 3-Track 체결 판정기"""
+    if b_open <= 0: return False, 0.0
+
+    if track == "MARKET":
+        if b_open <= ma20_entry * 1.030:
+            return True, b_open
+    elif track == "PULLBACK":
+        limit_p = floor_to_tick(ma20_entry * 1.005)
+        if b_open <= limit_p:
+            return True, b_open
+        elif b_low <= limit_p:
+            return True, limit_p
+    elif track == "BREAKOUT":
+        trigger_p = ceil_to_tick(high_20 * 1.002)
+        if b_open >= trigger_p:
+            return True, b_open
+        elif b_high >= trigger_p:
+            return True, trigger_p
+    return False, 0.0
+
+def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_holding=10, sell_fee=0.0020):
+    """
+    단일 종목 및 포트폴리오에 100% 공통 적용되는 일중 포지션 라이프사이클 관리 엔진:
+    Gap Down -> 장중 Stop -> Trend Break -> T1(30%) & 본전스탑 & 당일급락 재검사 ->
+    1.5R 보호스탑 -> T2(40%) & +1R 보호스탑 -> 고점대비 1.5 ATR Trailing -> T3 -> Time Stop
+    """
+    b_open = float(bar['Open'])
+    b_high = float(bar['High'])
+    b_low = float(bar['Low'])
+    b_close = float(bar['Close'])
+
+    pos["holding_days"] += 1
+    h_days = pos["holding_days"]
+    e_price = pos["entry_price"]
+    c_stop = pos["current_stop"]
+    cur_shares = pos["shares"]
+    pos["peak_price"] = max(pos["peak_price"], b_high)
+
+    exit_event = None
+    exit_price = 0.0
+    cash_gain_today = 0.0
+
+    # 1. 오버나이트 갭다운
+    if h_days > 1 and b_open <= c_stop:
+        exit_event = "GAP_DOWN_STOP" if not pos["t1_hit"] else "GAP_DOWN_TRAILING"
+        exit_price = b_open
+    # 2. 장중 손절 터치
+    elif b_low <= c_stop:
+        exit_event = "STOP_LOSS" if not pos["t1_hit"] else "TRAILING_STOP"
+        exit_price = c_stop
+    # 3. Trend Break (T1 이후 5일선 및 전일저점 동시 붕괴)
+    elif pos["t1_hit"] and (b_close < ma5_val) and (b_close < prev_low):
+        exit_event = "TREND_BREAK_EXIT"
+        exit_price = b_close
+    else:
+        # 4. T1 도달 (30%)
+        if not pos["t1_hit"] and b_high >= pos["t1"]:
+            pos["t1_hit"] = True
+            s_qty = min(int(pos["orig_shares"] * 0.30), cur_shares)
+            gain = s_qty * pos["t1"] * (1.0 - sell_fee)
+            cash_gain_today += gain
+            pos["cash_inflow"] += gain
+            pos["shares"] -= s_qty
+            cur_shares = pos["shares"]
+            pos["current_stop"] = max(pos["current_stop"], e_price)
+
+            # 당일 본전 급락 재검사
+            if b_low <= e_price and cur_shares > 0:
+                exit_event = "T1_THEN_BREAKEVEN"
+                exit_price = e_price
+
+        # 5. 1.5R 보호 스탑 (+0.5R)
+        if exit_event is None and pos["t1_hit"] and not pos["t2_hit"]:
+            r1 = pos["t1"] - e_price
+            if b_high >= e_price + (1.5 * r1):
+                pos["current_stop"] = max(pos["current_stop"], floor_to_tick(e_price + 0.5 * r1))
+
+        # 6. T2 도달 (40%) & +1.0R 보호 스탑
+        if exit_event is None and not pos["t2_hit"] and b_high >= pos["t2"]:
+            pos["t2_hit"] = True
+            s_qty = min(int(pos["orig_shares"] * 0.40), pos["shares"])
+            gain = s_qty * pos["t2"] * (1.0 - sell_fee)
+            cash_gain_today += gain
+            pos["cash_inflow"] += gain
+            pos["shares"] -= s_qty
+            cur_shares = pos["shares"]
+            r1 = pos["t1"] - e_price
+            pos["current_stop"] = max(pos["current_stop"], floor_to_tick(e_price + 1.0 * r1))
+
+        # 7. T2 달성 후 고점 대비 1.5 ATR 다이내믹 트레일링
+        if exit_event is None and pos["t2_hit"]:
+            dynamic_trail = floor_to_tick(pos["peak_price"] - (1.5 * pos["atr"]))
+            pos["current_stop"] = max(pos["current_stop"], dynamic_trail)
+
+        # 8. T3 도달 (잔여 전량)
+        if exit_event is None and b_high >= pos["t3"]:
+            pos["t3_hit"] = True
+            exit_event = "TARGET_3R_FULL"
+            exit_price = pos["t3"]
+        # 9. Time Stop
+        elif exit_event is None and h_days >= max_holding:
+            exit_event = "TIME_STOP"
+            exit_price = b_close
+
+    # 완전 청산 시 실현손익 확정
+    if exit_event is not None:
+        rem_shares = pos["shares"]
+        final_gain = rem_shares * exit_price * (1.0 - sell_fee)
+        cash_gain_today += final_gain
+        tot_inflow = pos["cash_inflow"] + final_gain
+        net_pnl_krw = tot_inflow - pos["total_invested"]
+        net_ret_pct = (net_pnl_krw / pos["total_invested"]) * 100.0 if pos["total_invested"] > 0 else 0.0
+
+        trade_record = {
+            "종목코드": pos.get("code", ""),
+            "진입일": pos["entry_date"],
+            "청산일": cur_date_str,
+            "진입트랙": pos["track"],
+            "진입가": int(e_price),
+            "최종청산가": int(exit_price),
+            "투자원금(원)": int(pos["total_invested"]),
+            "실현손익(원)": int(net_pnl_krw),
+            "순수익률(%)": round(net_ret_pct, 2),
+            "청산사유": exit_event,
+            "보유거래일": h_days,
+            "T1_달성": pos["t1_hit"],
+            "T2_달성": pos["t2_hit"],
+            "T3_달성": pos["t3_hit"]
+        }
+        return None, cash_gain_today, trade_record
+
+    return pos, cash_gain_today, None
+
+# -------------------------------------------------------------
+# 8. [단일 종목] 일별 MTM 실계좌 백테스터
+# -------------------------------------------------------------
+def run_daily_mtm_backtest(df_hist, df_dual_regime, max_holding=10, initial_capital=30000000, risk_pct=1.0, buy_cost=0.05, sell_cost=0.20):
+    if len(df_hist) < 120 or df_dual_regime.empty: return pd.DataFrame(), pd.DataFrame(), {}
+    
+    df_p = df_hist.copy()
+    df_p.index = pd.to_datetime(df_p.index).normalize()
+    df_reg = df_dual_regime.copy()
+    df_reg.index = pd.to_datetime(df_reg.index).normalize()
+    
+    buy_fee = buy_cost / 100.0
+    sell_fee = sell_cost / 100.0
+
+    cash = float(initial_capital)
+    active_pos = None
+    pending_entry = None
+    
+    daily_records = []
+    closed_trades = []
+
+    for idx in range(60, len(df_p)):
+        cur_date = df_p.index[idx]
+        cur_date_str = cur_date.strftime("%Y-%m-%d")
+        bar = df_p.iloc[idx]
+        b_open, b_high, b_low, b_close = float(bar['Open']), float(bar['High']), float(bar['Low']), float(bar['Close'])
+
+        # ---------------------------------------------------------
+        # A. 공통 3-Track 진입 실행
+        # ---------------------------------------------------------
+        if active_pos is None and pending_entry is not None:
+            executed, e_price = check_3track_execution(
+                pending_entry["track"], b_open, b_high, b_low,
+                pending_entry["ma20_entry"], pending_entry["high_20"]
+            )
+            if executed and e_price > 0:
+                plan = calculate_execution_levels(df_p.iloc[:idx], e_price)
+                if not plan["is_excessive_stop"]:
+                    clean_amt = get_clean_avg_amount(df_p.iloc[:idx], 20)
+                    pos = calculate_position_sizing(cash, risk_pct, pending_entry["multiplier"], e_price, plan["risk_1r"], plan["atr14"], clean_amt)
+                    shares = pos["shares"]
+                    if shares > 0:
+                        req_cash = shares * e_price * (1.0 + buy_fee)
+                        if cash >= req_cash:
+                            cash -= req_cash
+                            active_pos = {
+                                "entry_date": cur_date_str,
+                                "entry_price": e_price,
+                                "shares": shares,
+                                "orig_shares": shares,
+                                "current_stop": plan["stop_price"],
+                                "t1": plan["target_1r"],
+                                "t2": plan["target_2r"],
+                                "t3": plan["target_3r"],
+                                "t1_hit": False,
+                                "t2_hit": False,
+                                "t3_hit": False,
+                                "holding_days": 0,
+                                "cash_inflow": 0.0,
+                                "total_invested": req_cash,
+                                "peak_price": e_price,
+                                "atr": plan["atr14"],
+                                "track": pending_entry["track"]
+                            }
+            pending_entry = None
+
+        # ---------------------------------------------------------
+        # B. 공통 포지션 관리 & 동적 트레일링 & 완결 회계
+        # ---------------------------------------------------------
+        if active_pos is not None:
+            ma5_val = float(df_p['Close'].iloc[idx-4:idx+1].mean())
+            prev_low = float(df_p['Low'].iloc[idx-1])
+            active_pos, cash_gain, trade_rec = process_intraday_position(
+                active_pos, bar, ma5_val, prev_low, cur_date_str, max_holding=max_holding, sell_fee=sell_fee
+            )
+            cash += cash_gain
+            if trade_rec is not None:
+                closed_trades.append(trade_rec)
+
+        # ---------------------------------------------------------
+        # C. 일별 시가평가(MTM)
+        # ---------------------------------------------------------
+        holding_val = (active_pos["shares"] * b_close) if active_pos is not None else 0.0
+        tot_equity = cash + holding_val
+        daily_records.append({
+            "Date": cur_date, "Cash": cash, "Stock_Value": holding_val,
+            "Total_Equity": tot_equity, "In_Position": (active_pos is not None)
+        })
+
+        # ---------------------------------------------------------
+        # D. 장 마감 후 익일 진입 시그널 평가
+        # ---------------------------------------------------------
+        if active_pos is None and pending_entry is None:
+            past_reg = df_reg.loc[df_reg.index <= cur_date]
+            reg_code = past_reg.iloc[-1]['Regime'] if not past_reg.empty else "NEUTRAL"
+            ks_sub = df_reg[['KS_Close']].rename(columns={'KS_Close': 'Close'}).loc[:cur_date]
+
+            dec = evaluate_full_execution_pipeline(df_p.iloc[:idx+1], reg_code, kospi_slice=ks_sub, has_frgn=False)
+            if "BUY" in dec["action"]:
+                pending_entry = {
+                    "regime": reg_code,
+                    "multiplier": dec["multiplier"],
+                    "track": dec["scored"]["track"],
+                    "high_20": dec["scored"]["high_20"],
+                    "ma20_entry": dec["scored"]["ma20"]
+                }
+
+    daily_df = pd.DataFrame(daily_records).set_index("Date")
+    trades_df = pd.DataFrame(closed_trades)
+
+    if daily_df.empty: return daily_df, trades_df, {}
+
+    daily_df['Peak'] = daily_df['Total_Equity'].cummax()
+    daily_df['Drawdown_pct'] = ((daily_df['Total_Equity'] - daily_df['Peak']) / daily_df['Peak']) * 100.0
+    true_daily_mdd = round(abs(daily_df['Drawdown_pct'].min()), 2)
+    tot_ret_pct = round(((daily_df['Total_Equity'].iloc[-1] - initial_capital) / initial_capital) * 100.0, 2)
+
+    if not trades_df.empty:
+        wins_krw = trades_df[trades_df['실현손익(원)'] > 0]['실현손익(원)']
+        losses_krw = trades_df[trades_df['실현손익(원)'] < 0]['실현손익(원)'].abs()
+        profit_factor = round(wins_krw.sum() / losses_krw.sum(), 2) if losses_krw.sum() > 0 else 99.9
+        expectancy_krw = int(trades_df['실현손익(원)'].mean())
+        win_rate = round((len(wins_krw) / len(trades_df)) * 100, 1)
+        t1_rate = round((trades_df['T1_달성'].sum() / len(trades_df)) * 100, 1)
+        t2_rate = round((trades_df['T2_달성'].sum() / len(trades_df)) * 100, 1)
+    else:
+        profit_factor, expectancy_krw, win_rate, t1_rate, t2_rate = 0.0, 0, 0.0, 0.0, 0.0
+
+    metrics = {
+        "final_equity": int(daily_df['Total_Equity'].iloc[-1]),
+        "total_return_pct": tot_ret_pct,
+        "true_daily_mdd": true_daily_mdd,
+        "profit_factor": profit_factor,
+        "expectancy_krw": expectancy_krw,
+        "win_rate": win_rate,
+        "t1_rate": t1_rate,
+        "t2_rate": t2_rate,
+        "total_trades": len(trades_df)
+    }
+
+    return daily_df, trades_df, metrics
+
+# -------------------------------------------------------------
+# 9. [포트폴리오 바스켓] 다종목 동시 자본 배분 시뮬레이터 (엔진 완전 일치)
+# -------------------------------------------------------------
+def run_portfolio_backtest(ticker_list, df_dual_regime, df_krx=None, max_positions=3, max_holding=10, initial_capital=50000000, risk_pct=1.0):
+    s_date = (datetime.date.today() - datetime.timedelta(days=730)).strftime("%Y-%m-%d")
+    data_dict = {}
+
+    for item in ticker_list:
+        clean_item = str(item).strip()
+        if not clean_item: continue
+        code = None
+        if df_krx is not None and not df_krx.empty:
+            code, _ = find_stock_code(clean_item, df_krx)
+        if not code and clean_item.isdigit():
+            code = clean_item.zfill(6)
+        if not code: continue
+
+        try:
+            h = fdr.DataReader(code, s_date)
+            if h is not None and len(h) >= 120:
+                h.index = pd.to_datetime(h.index).normalize()
+                data_dict[code] = h
+        except Exception:
+            continue
+
+    if not data_dict or df_dual_regime.empty: return pd.DataFrame(), pd.DataFrame(), {}
+
+    common_dates = sorted(list(set.intersection(*[set(df.index) for df in data_dict.values()])))
+    common_dates = [d for d in common_dates if d >= pd.Timestamp(s_date)]
+    if len(common_dates) < 60: return pd.DataFrame(), pd.DataFrame(), {}
+
+    cash = float(initial_capital)
+    positions = {}
+    pending_signals = []
+    daily_records = []
+    closed_trades = []
+
+    buy_fee = 0.0005
+    sell_fee = 0.0020
+
+    for cur_date in common_dates[60:]:
+        cur_date_str = cur_date.strftime("%Y-%m-%d")
+
+        # ---------------------------------------------------------
+        # 1. 3-Track 진입 실행 (점수 높은 순서로 슬롯 배정)
+        # ---------------------------------------------------------
+        if pending_signals and len(positions) < max_positions:
+            pending_signals.sort(key=lambda x: x["score"], reverse=True)
+            for item in pending_signals:
+                code = item["code"]
+                if len(positions) >= max_positions: break
+                if code in positions: continue
+
+                df_code = data_dict[code].loc[:cur_date]
+                bar_today = df_code.iloc[-1]
+                b_open, b_high, b_low = float(bar_today['Open']), float(bar_today['High']), float(bar_today['Low'])
+
+                executed, e_price = check_3track_execution(
+                    item["track"], b_open, b_high, b_low, item["ma20_entry"], item["high_20"]
+                )
+                if not executed or e_price <= 0: continue
+
+                plan = calculate_execution_levels(df_code.iloc[:-1], e_price)
+                if plan["is_excessive_stop"]: continue
+
+                avail_cash = cash / (max_positions - len(positions))
+                clean_amt = get_clean_avg_amount(df_code.iloc[:-1], 20)
+                pos_calc = calculate_position_sizing(avail_cash, risk_pct, item["multiplier"], e_price, plan["risk_1r"], plan["atr14"], clean_amt)
+                shares = pos_calc["shares"]
+                req_cash = shares * e_price * (1.0 + buy_fee)
+
+                if shares > 0 and cash >= req_cash:
+                    cash -= req_cash
+                    positions[code] = {
+                        "code": code,
+                        "entry_date": cur_date_str,
+                        "entry_price": e_price,
+                        "shares": shares,
+                        "orig_shares": shares,
+                        "current_stop": plan["stop_price"],
+                        "t1": plan["target_1r"],
+                        "t2": plan["target_2r"],
+                        "t3": plan["target_3r"],
+                        "t1_hit": False,
+                        "t2_hit": False,
+                        "t3_hit": False,
+                        "holding_days": 0,
+                        "cash_inflow": 0.0,
+                        "total_invested": req_cash,
+                        "peak_price": e_price,
+                        "atr": plan["atr14"],
+                        "track": item["track"]
+                    }
+            pending_signals = []
+
+        # ---------------------------------------------------------
+        # 2. 공통 포지션 관리 & 동적 트레일링 & 완결 회계
+        # ---------------------------------------------------------
+        closed_codes = []
+        for code, p in positions.items():
+            df_code = data_dict[code].loc[:cur_date]
+            bar = df_code.iloc[-1]
+            ma5_val = float(df_code['Close'].iloc[-5:].mean())
+            prev_low = float(df_code['Low'].iloc[-2])
+
+            updated_p, cash_gain, trade_rec = process_intraday_position(
+                p, bar, ma5_val, prev_low, cur_date_str, max_holding=max_holding, sell_fee=sell_fee
+            )
+            cash += cash_gain
+            if trade_rec is not None:
+                closed_trades.append(trade_rec)
+                closed_codes.append(code)
+            else:
+                positions[code] = updated_p
+
+        for c in closed_codes: del positions[c]
+
+        # ---------------------------------------------------------
+        # 3. MTM 일별 시가평가
+        # ---------------------------------------------------------
+        stk_val = sum(p["shares"] * float(data_dict[c].loc[cur_date, 'Close']) for c, p in positions.items())
+        daily_records.append({
+            "Date": cur_date, "Cash": cash, "Stock_Value": stk_val,
+            "Total_Equity": cash + stk_val, "Num_Positions": len(positions)
+        })
+
+        # ---------------------------------------------------------
+        # 4. 익일 진입 스캔 (3-Track 정보 완전 보존)
+        # ---------------------------------------------------------
+        if len(positions) < max_positions:
+            past_reg = df_dual_regime.loc[df_dual_regime.index <= cur_date]
+            reg_code = past_reg.iloc[-1]['Regime'] if not past_reg.empty else "NEUTRAL"
+            ks_sub = df_dual_regime[['KS_Close']].rename(columns={'KS_Close': 'Close'}).loc[:cur_date]
+
+            for code in data_dict.keys():
+                if code not in positions:
+                    df_sub = data_dict[code].loc[:cur_date]
+                    dec = evaluate_full_execution_pipeline(df_sub, reg_code, kospi_slice=ks_sub, has_frgn=False)
+                    if "BUY" in dec["action"]:
+                        pending_signals.append({
+                            "code": code,
+                            "multiplier": dec["multiplier"],
+                            "score": dec["scored"]["score"],
+                            "track": dec["scored"]["track"],
+                            "high_20": dec["scored"]["high_20"],
+                            "ma20_entry": dec["scored"]["ma20"]
+                        })
+
+    port_df = pd.DataFrame(daily_records).set_index("Date")
+    p_trades = pd.DataFrame(closed_trades)
+    if port_df.empty: return port_df, p_trades, {}
+
+    port_df['Peak'] = port_df['Total_Equity'].cummax()
+    port_df['Drawdown_pct'] = ((port_df['Total_Equity'] - port_df['Peak']) / port_df['Peak']) * 100.0
+    p_mdd = round(abs(port_df['Drawdown_pct'].min()), 2)
+    p_ret = round(((port_df['Total_Equity'].iloc[-1] - initial_capital) / initial_capital) * 100.0, 2)
+
+    if not p_trades.empty:
+        wins_krw = p_trades[p_trades['실현손익(원)'] > 0]['실현손익(원)']
+        losses_krw = p_trades[p_trades['실현손익(원)'] < 0]['실현손익(원)'].abs()
+        p_pf = round(wins_krw.sum() / losses_krw.sum(), 2) if losses_krw.sum() > 0 else 99.9
+        p_exp = int(p_trades['실현손익(원)'].mean())
+        p_win = round((len(wins_krw) / len(p_trades)) * 100, 1)
+    else:
+        p_pf, p_exp, p_win = 0.0, 0, 0.0
+
+    metrics = {
+        "final_equity": int(port_df['Total_Equity'].iloc[-1]),
+        "return_pct": p_ret,
+        "mdd_pct": p_mdd,
+        "profit_factor": p_pf,
+        "expectancy_krw": p_exp,
+        "win_rate": p_win,
+        "total_trades": len(p_trades)
+    }
+
+    return port_df, p_trades, metrics
+
+# -------------------------------------------------------------
+# [UI 라우팅 및 뷰 구성]
+# -------------------------------------------------------------
+dual_regime = get_current_dual_regime()
+
+st.title("⚖️ QUANT-EXECUTION ENGINE PRO MAX")
+st.caption("“주가를 예측하지 않고, **틀렸을 때 손실을 제한하고 맞았을 때 분할 익절**하도록 통제하는 기계적 실행 시스템”")
+
+c_rg1, c_rg2 = st.columns([1, 3])
+with c_rg1:
+    st.metric("실시간 듀얼 시장 국면", dual_regime["status"], f"배분 배수: {dual_regime['multiplier']}x")
+with c_rg2:
+    st.info(f"💡 **시장 대응 지침**: {dual_regime['msg']}")
+
+if "selected_stock" not in st.session_state:
+    st.session_state["selected_stock"] = "삼성전자"
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🎯 STEP 1 · 실행 중심 퀀트 진단 & 포지션 계산",
+    "📡 STEP 2 · 코스피 Buy Zone 스크리너",
+    "🧪 STEP 3 · 단일 종목 실계좌 MTM 백테스트",
+    "💼 STEP 4 · 다종목 포트폴리오 시뮬레이터",
+    "📖 시스템 무결성 헌장"
+])
+
+# -------------------------------------------------------------
+# TAB 1: 퀀트 진단 & 포지션 계산
 # -------------------------------------------------------------
 with tab1:
-    st.subheader("🎯 STEP 1 · 주도 수급 스크리너")
-    st.caption("주도주 조건: 5일 누적 상승률 ≥ 7% | 거래대금 상위 설정 비율(상세 조회 상한 적용) | 20일 거래량 ≥ 2.0x | 시총 ≥ 2,000억 | 당일 등락률 ≥ -2.0%")
+    st.subheader("정밀 실행 계획 & 리스크 기반 포지션 산출")
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3 = st.columns([2, 1.5, 1])
     with col1:
-        min_return_5d = st.slider("5일 누적 상승률 하한 (%)", 0, 30, 7)
-        top_amount_pct = st.slider("거래대금 상위 비율 (%)", 5, 50, 20, step=5)
+        target_stock = st.text_input("종목명 또는 6자리 코드", value=st.session_state["selected_stock"])
     with col2:
-        vol_mult_20d = st.slider("20일 평균 거래량 대비 배수", 1.0, 5.0, 2.0, step=0.1)
-        vol_mult_prev = st.slider("전일 거래량 대비 배수", 1.0, 3.0, 1.5, step=0.1)
+        acc_cap = st.number_input("내 총 계좌 잔고 (원)", min_value=1000000, value=30000000, step=5000000)
     with col3:
-        min_market_cap = st.number_input("시총 하한 (억원)", 500, 10000, 2000, step=500)
-        min_daily_return = st.slider("당일 등락률 하한 (%)", -5.0, 2.0, -2.0, step=0.5)
-        max_scan_count = st.number_input("최대 상세 조회 종목 수", 50, 300, 150, step=25,
-                                         help="응답 속도를 위해 거래대금 상위 종목 중 이 수만 최근 시세를 조회합니다.")
+        risk_pct_input = st.slider("1회 허용 손실률 (%)", 0.3, 2.0, 1.0, step=0.1)
 
-    if st.button("주도 후보군 스크리닝 실행", type="primary"):
-        with st.spinner("KRX 종목 스캔 및 20일 거래량·수익률 검증 중..."):
-            try:
-                df_krx = load_krx_listing()
-                if df_krx.empty:
-                    st.error("상장 종목 데이터를 수집하지 못했습니다.")
-                else:
-                    data_source = df_krx['DataSource'].iloc[0] if 'DataSource' in df_krx.columns else '원천 미확인'
-                    df_krx = df_krx.drop_duplicates(subset=['Code']).reset_index(drop=True)
-                    df_cap_filtered = df_krx[df_krx['Marcap'] >= (min_market_cap * 100000000)].copy()
-                    df_cap_filtered = df_cap_filtered.sort_values(by="Amount", ascending=False)
-                    percent_count = max(10, int(len(df_cap_filtered) * (top_amount_pct / 100)))
-                    top_count = min(percent_count, int(max_scan_count))
-                    df_target_pool = df_cap_filtered.head(top_count)
-                    
-                    screened_stocks = []
-                    fail_count = 0
-                    error_samples = []
-                    scan_date = datetime.date.today().isoformat()
-                    candidate_codes = tuple(df_target_pool['Code'].astype(str).str.zfill(6).tolist())
-
-                    # 첫 실행은 최대 8개 동시 조회, 동일 대상·날짜의 재실행은 캐시 사용
-                    metrics_rows = load_screening_metrics_batch(candidate_codes, scan_date)
-                    metrics_by_code = {item['code']: item for item in metrics_rows}
-                    
-                    progress_bar = st.progress(0)
-                    total_len = len(df_target_pool)
-
-                    for idx, (_, row) in enumerate(df_target_pool.iterrows()):
-                        progress_bar.progress((idx + 1) / total_len)
-                        code = str(row['Code']).zfill(6)
-                        name = row['Name']
-                        metrics = metrics_by_code.get(code)
-                        if not metrics or not metrics['ok']:
-                            fail_count += 1
-                            if len(error_samples) < 3:
-                                detail = metrics.get('error', '조회 결과 없음') if metrics else '조회 결과 없음'
-                                error_samples.append(f"{name}({code}): {detail}")
-                            continue
-
-                        if (metrics['return_5d'] >= min_return_5d and
-                            metrics['vol_ratio_20d'] >= vol_mult_20d and
-                            metrics['vol_ratio_prev'] >= vol_mult_prev and
-                            metrics['return_1d'] >= min_daily_return):
-                            screened_stocks.append({
-                                "코드": code, "종목명": name, "현재가": int(metrics['last_close']),
-                                "당일등락(%)": round(metrics['return_1d'], 2),
-                                "5일수익률(%)": round(metrics['return_5d'], 2),
-                                "20일평균대비(배)": round(metrics['vol_ratio_20d'], 2),
-                                "시가총액(억)": int(row['Marcap'] / 100000000),
-                                "거래대금(억)": int(row['Amount'] / 100000000)
-                            })
-                    
-                    progress_bar.empty()
-                    res_df = pd.DataFrame(screened_stocks)
-                    st.session_state["screened_df"] = res_df
-                    if not res_df.empty:
-                        msg = f"필터링 완료! 주도 후보군 발굴: **{len(res_df)}개** (데이터 원천: {data_source}, 초기 풀: {len(df_krx)}종목, 상세 조회: {len(df_target_pool)}종목)"
-                        if fail_count > 0:
-                            msg += f" [제외/데이터 부족: {fail_count}건]"
-                        st.success(msg)
-                    else:
-                        st.warning(f"조건에 부합하는 종목이 없습니다. (데이터 원천: {data_source}) 필터 조건을 완화해 보세요.")
-                    
-                    if error_samples:
-                        with st.expander("⚠️ 스크리너 데이터 조회 제외/오류 샘플"):
-                            for err in error_samples:
-                                st.write(f"- {err}")
-            except Exception as e:
-                st.error(f"스크리너 실행 오류: {e}")
-
-    if "screened_df" in st.session_state and not st.session_state["screened_df"].empty:
-        df_display = st.session_state["screened_df"]
-        st.dataframe(df_display, width='stretch')
-
-        if st.button("테마 및 주도주 AI 분류 (Gemini)"):
-            if not client:
-                st.warning("사이드바에 Gemini API Key를 입력해야 AI 분류 기능을 사용할 수 있습니다.")
+    if st.button("실행 계획 정밀 진단", type="primary"):
+        with st.spinner("호가 검증 및 100점 파이프라인 연산 중..."):
+            df_krx = load_krx_listing()
+            code, name = find_stock_code(target_stock, df_krx)
+            
+            if not code:
+                st.error("종목을 찾을 수 없습니다.")
             else:
-                stock_names = df_display["종목명"].tolist()
-                theme_prompt = f"""
-                당신은 시니어 퀀트 리서치 센터장입니다. 
-                아래 주도 종목들의 산업 연관성과 수급 성격을 바탕으로 시장 주도 테마와 1등 대장주/수혜주를 분류하세요:
-                [목록]: {', '.join(stock_names)}
-                - 테마명, 거시 트리거, 1등 대장주, 후발 수혜주 형식으로 사실관계에 입각하여 명확히 작성하세요.
-                """
-                with st.spinner("AI 분석 중..."):
-                    try:
-                        res_text = generate_content_with_retry(client, theme_prompt)
-                        st.markdown(res_text)
-                    except Exception as e:
-                        st.error(f"오류: {e}")
+                s_date = (datetime.date.today() - datetime.timedelta(days=350)).strftime("%Y-%m-%d")
+                df_p = fdr.DataReader(code, s_date)
+                df_ks = fdr.DataReader('KS11', s_date)
+                
+                if df_p is None or len(df_p) < 40:
+                    st.error("데이터가 불충분합니다.")
+                else:
+                    supply = get_supply_data(code)
+                    verdict = evaluate_full_execution_pipeline(
+                        df_p, dual_regime["code"], kospi_slice=df_ks, has_frgn=(supply["frgn_5"] > 0)
+                    )
+                    levels = verdict["levels"]
+                    scored = verdict["scored"]
+                    curr_price = int(df_p['Close'].iloc[-1])
+
+                    clean_amt = get_clean_avg_amount(df_p, 20)
+                    pos = calculate_position_sizing(
+                        acc_cap, risk_pct_input, verdict["multiplier"],
+                        curr_price, levels["risk_1r"], levels["atr14"], clean_amt
+                    )
+
+                    st.markdown("---")
+                    if "BUY" in verdict["action"]:
+                        st.success(f"### {verdict['badge']}\n**진입 전략 트랙**: `{scored['track']}` | **지침**: {verdict['reason']}")
+                    elif verdict["action"] == "WAIT":
+                        st.warning(f"### {verdict['badge']}\n**지침**: {verdict['reason']}")
+                    else:
+                        st.error(f"### {verdict['badge']}\n**지침**: {verdict['reason']}")
+
+                    st.markdown("#### 💯 100점 만점 퀀트 평가 내역")
+                    dt_cols = st.columns(6)
+                    for i, (k, v) in enumerate(scored["details"].items()):
+                        dt_cols[i].metric(k, v)
+
+                    if levels["resistance_warning"]:
+                        st.warning(f"⚠️ **저항선 주의**: {levels['resistance_warning']}")
+
+                    st.markdown("### 🛑 기계적 가격선 및 손익비 구조")
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("진입 기준가", f"{levels['entry_price']:,}원", f"Wilder ATR: {levels['atr14']:,}원")
+                    m2.metric("동적 손절선 (보수적)", f"{levels['stop_price']:,}원", f"{levels['loss_pct']}%", delta_color="inverse")
+                    m3.metric("1차 익절가 (30% 매도 & 본전스탑)", f"{levels['target_1r']:,}원", "+1.0R")
+                    m4.metric("2차 익절가 (40% 매도)", f"{levels['target_2r']:,}원", "+2.0R")
+
+                    st.markdown("### 💼 계좌 리스크 기반 포지션 및 2-Track 손실 시뮬레이션")
+                    p1, p2, p3, p4 = st.columns(4)
+                    p1.metric("최종 권장 매수 수량", f"{pos['shares']:,}주", f"계좌 비중: {pos['weight_pct']}%")
+                    p2.metric("총 매수 소요 대금", f"{pos['total_invest']:,}원", "유동성/비중 상한 반영")
+                    p3.metric("정상 손절 시 손실액", f"-{pos['normal_risk_loss']:,}원", "1R 원칙 통제")
+                    p4.metric("스트레스 갭다운(-1ATR)", f"-{pos['worst_gap_loss']:,}원", "오버나이트 급락 가정", delta_color="inverse")
+
+                    if client:
+                        prompt = f"""
+                        당신은 엄격한 퀀트 트레이딩 데스크의 리스크 통제 총괄입니다.
+                        다음 정량 데이터를 바탕으로 {name}({code})의 기계적 매매 지침을 브리핑하세요.
+                        - 듀얼 시장 국면: {dual_regime['status']} (실행 배수 {verdict['multiplier']}x)
+                        - 퀀트 평가: {scored['score']}점 ({scored['grade']}), 추천 트랙: {scored['track']}
+                        - 진입 기준가: {curr_price:,}원 / 손절가: {levels['stop_price']:,}원 ({levels['loss_pct']}%)
+                        - 1차 목표가: {levels['target_1r']:,}원 / 2차 목표가: {levels['target_2r']:,}원
+                        - 권장 주문 수량: {pos['shares']}주 (정상 손실 -{pos['normal_risk_loss']:,}원, 스트레스 갭손실 -{pos['worst_gap_loss']:,}원)
+                        - 저항선 경고: {levels['resistance_warning']}
+                        *과도한 낙관을 배제하고 자본 보존과 손익비 관점에서 3~4문장으로 서술하세요.*
+                        """
+                        with st.spinner("AI 리스크 브리핑 작성 중..."):
+                            rep = generate_ai_briefing(client, prompt)
+                            st.info(f"**AI 리스크 브리핑**:\n\n{rep}")
 
 # -------------------------------------------------------------
-# STEP 2: 퀀트 실행 분석 (Quad-Matrix)
+# TAB 2: 코스피 Buy Zone 스크리너
 # -------------------------------------------------------------
 with tab2:
-    st.subheader("🎯 STEP 2 · 퀀트 실행 분석 (Quad-Matrix)")
-    st.caption("종목 퀄리티와 진입 타이밍을 엄격히 분리하고, R-Multiple 익절과 2단계 손절 규칙으로 기계적 매매를 지원합니다.")
-    
-    target_stock = st.text_input("분석할 종목명을 입력하세요 (예: JW홀딩스, jw홀딩스, SK하이닉스, 001060)")
+    st.subheader("코스피 Buy Zone 지지 및 반등 트리거 탐색기")
+    st.caption("동일한 100점 파이프라인을 전 종목 풀에 실시간 적용하여 70점 이상 유효 종목만 선별합니다.")
 
-    if st.button("종목 정밀 실행 분석 실행", type="primary"):
-        if not target_stock.strip():
-            st.warning("종목명을 입력해주세요.")
-        else:
-            with st.spinner(f"'{target_stock}' 종목 확인 및 Quad-Matrix 연산 중..."):
-                try:
-                    df_krx = load_krx_listing()
-                    target_code, verified_name = find_stock_code(target_stock, df_krx)
+    c_s1, c_s2 = st.columns(2)
+    with c_s1:
+        min_cap = st.number_input("시가총액 하한 (억원)", 500, 20000, 2000, step=500)
+    with c_s2:
+        scan_pool = st.slider("스캔 풀 (거래대금 상위)", 100, 300, 150, step=50)
 
-                    if not target_code:
-                        st.error(f"'{target_stock}' 종목을 찾을 수 없습니다. 정확한 종목명이나 6자리 코드를 확인하세요.")
-                    else:
-                        start_hist = (datetime.datetime.today() - datetime.timedelta(days=400)).strftime("%Y-%m-%d")
-                        df_price = fdr.DataReader(target_code, start_hist)
+    if st.button("Buy Zone 종목 스캔 시작", type="primary"):
+        with st.spinner("코스피 후보군 100점 평가 검증 중..."):
+            df_k = fdr.StockListing('KOSPI')
+            if df_k is None or df_k.empty:
+                st.error("코스피 종목 로드 실패.")
+            else:
+                df_k['Code'] = df_k['Code'].astype(str).str.zfill(6)
+                if 'Amount' not in df_k.columns or df_k['Amount'].isnull().all():
+                    df_k['Amount'] = df_k['Close'] * df_k['Volume']
+                
+                pool = df_k[df_k['Marcap'] >= (min_cap * 100000000)].sort_values(by="Amount", ascending=False).head(scan_pool)
+                screened = []
+                p_bar = st.progress(0)
+                s_date = (datetime.date.today() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
+                df_ks = fdr.DataReader('KS11', s_date)
+
+                for idx, (_, r) in enumerate(pool.iterrows()):
+                    p_bar.progress((idx + 1) / len(pool))
+                    code, name = str(r['Code']).zfill(6), r['Name']
+                    try:
+                        h = fdr.DataReader(code, s_date)
+                        if h is None or len(h) < 30: continue
                         
-                        # 21거래일 전체에 대한 결측/양수 검증 (P2 해결)
-                        required_cols = ['Close', 'Open', 'High', 'Low', 'Volume']
-                        if df_price is None or not all(col in df_price.columns for col in required_cols):
-                            st.error(f"'{verified_name}'({target_code})의 OHLCV 필수 데이터가 누락되었습니다.")
-                        elif len(df_price) < 25:
-                            st.error(f"'{verified_name}'({target_code})의 과거 주가 데이터가 부족합니다 (최소 25거래일 필요).")
-                        elif df_price.tail(21)[required_cols].isna().any().any():
-                            st.error(f"'{verified_name}'의 최근 21거래일 시세에 결측치(NaN)가 포함되어 있습니다.")
-                        elif (df_price.tail(21)[['Close', 'Open', 'High', 'Low']] <= 0).any().any():
-                            st.error(f"'{verified_name}'의 최근 21거래일 시세에 비정상 가격(0 이하)이 존재합니다.")
-                        else:
-                            extra_data = get_comprehensive_stock_data(target_code)
-                            q = run_quad_execution_engine(df_price, extra_data)
+                        dec = evaluate_full_execution_pipeline(h, dual_regime["code"], kospi_slice=df_ks, has_frgn=False)
+                        if "BUY" in dec["action"]:
+                            c_p = int(h['Close'].iloc[-1])
+                            lvs = dec["levels"]
+                            screened.append({
+                                "코드": code, "종목명": name, "현재가": c_p,
+                                "스코어": f"{dec['scored']['score']}점",
+                                "트랙": dec['scored']['track'],
+                                "최종판정": dec["badge"], "손절가": lvs["stop_price"],
+                                "손절폭(%)": lvs["loss_pct"], "1차목표(1R)": lvs["target_1r"],
+                                "2차목표(2R)": lvs["target_2r"], "거래대금(억)": int(r['Amount'] / 100000000)
+                            })
+                    except Exception:
+                        continue
+                p_bar.empty()
+                df_res = pd.DataFrame(screened)
+                st.session_state["screened_res"] = df_res
+                if not df_res.empty:
+                    st.success(f"조건을 만족하는 **{len(df_res)}개 종목**이 포착되었습니다.")
+                else:
+                    st.warning("현재 매수 요건을 충족하는 종목이 없습니다.")
 
-                            # UI 1. 상태 배너
-                            if q["state_color"] == "warning":
-                                st.warning(f"### 🟡 {q['market_state']}\n**행동 지침**: {q['trigger_action']}")
-                            elif q["state_color"] == "success":
-                                st.success(f"### 🟢 {q['market_state']}\n**행동 지침**: {q['trigger_action']}")
-                            elif q["state_color"] == "error":
-                                st.error(f"### 🔴 {q['market_state']}\n**행동 지침**: {q['trigger_action']}")
-                            else:
-                                st.info(f"### ⚪ {q['market_state']}\n**행동 지침**: {q['trigger_action']}")
-
-                            # UI 2. QUAD-MATRIX
-                            st.markdown("### 📊 4대 독립 판단 매트릭스 (Quad-Matrix)")
-                            c1, c2, c3, c4 = st.columns(4)
-                            c1.metric("① QUALITY (퀄리티)", f"{q['quality_score']} / 100점", help="펀더멘털, 수급, 정배열 추세 종합 매력도")
-                            c2.metric("② TIMING (진입자리)", f"{q['timing_score']} / 100점", help="20일선 근접도 및 눌림목 적합도")
-                            c3.metric("③ RISK (과열/하방위험)", f"{q['risk_score']} / 100점", q['risk_label'], help="과열 및 저항 충돌 리스크")
-                            c4.metric("④ TRIGGER (실행신호)", q['trigger_state'], f"스코어: {q['trig_score']}/100점")
-
-                            ma60_str = f"{q['ma60']:,}원" if q['ma60'] else "미확인"
-                            st.markdown(f"**핵심 지표 요약**: 현재가 **{q['curr_price']:,}원** | 20일선 이격도 **{q['disp_display_str']}** | RSI(14) **{q['rsi_14']} ({q['rsi_desc']})** | 20일 평균 대비 거래량 **{q['vol_ratio_20d']}배** | 60일선 **{ma60_str}**")
-
-                            # UI 3. BUY ZONE & BREAKOUT PLAN
-                            st.markdown("### 🎯 기계적 매수 계획 (Zone & Breakout)")
-                            b_col1, b_col2 = st.columns(2)
-                            with b_col1:
-                                st.markdown("#### 🟢 눌림목 매수 (Pullback Plan)")
-                                st.markdown(f"""
-                                * **관찰 Buy Zone**: `{q['pullback_range']}` (기준가: {q['target_entry']:,}원)
-                                * **원칙**: 가격 도달만으로 절대 매수 금지 (반등 확인 필수)
-                                * **필수 반등 Trigger (2개 이상 충족 시 분할 진입 가동)**:
-                                  - [ ] 20일선(±1.5%) 지지 확인 후 종가가 20일선 위 안착
-                                  - [ ] 당일 양봉 마감 (종가 > 시가)
-                                  - [ ] 장중 저점 찍고 전일 종가 이상 회복
-                                  - [ ] 종가 기준 5일 이동평균선 재탈환
-                                  - [ ] 거래량 20일 평균 대비 1.2배 이상 또는 외인 5일 순매수 유입
-                                """)
-                            with b_col2:
-                                st.markdown("#### 🔵 전고점 돌파 매수 (Breakout Plan)")
-                                st.markdown(f"""
-                                * **돌파 타겟 기준선**: `{q['breakout_price']:,}원` (직전 20일 고점: {q['high_20']:,}원 상향 돌파)
-                                * **돌파 확인 조건**:
-                                  - [ ] **1차 확인**: 20일 평균 거래량 1.5배 이상 수반하며 종가 기준 돌파
-                                  - [ ] **2차 확인**: 익일 재테스트 시 돌파선({q['high_20']:,}원) 종가 유지
-                                """)
-
-                            # UI 4. 손절선 구조화
-                            st.markdown("### 🛑 리스크 관리: 2단계 손절선 구조")
-                            st.caption(f"※ 초기 손절 손실률 기준가: **{q['target_entry']:,}원** (호가 단위 내림 적용)")
-                            s1, s2, s3 = st.columns(3)
-                            s1.metric("단기 초기 손절", q['stop_short_init'], "20일선 -1.5% 이탈")
-                            s2.metric("스윙 초기 손절 (권장)", q['stop_swing_init'], "20일선 -3.0% 이탈")
-                            s3.metric("중기 초기 손절", q['stop_mid_init'], "60일선 -3.0% 이탈")
-
-                            # UI 5. R-Multiple 목표
-                            st.markdown("### 📈 R-Multiple 익절 목표 vs 실제 차트 저항선")
-                            st.caption(f"단위 리스크(1R) = **{q['risk_unit_R']:,}원** (예상 진입가 - 스윙 손절가 실측폭)")
-                            
-                            r_col1, r_col2 = st.columns(2)
-                            with r_col1:
-                                st.markdown("#### 🎯 R-Multiple 기반 기계적 익절")
-                                st.markdown(f"""
-                                * **목표 1R**: `{q['target_1R']}` (리스크 단위 1배 도달)
-                                * **목표 2R (1차 권장 익절)**: `{q['target_2R']}` (신규 진입 성공 시 30% 차익 실현)
-                                * **목표 3R (추세 확장)**: `{q['target_3R']}` (잔량 추세 트레일링 타겟)
-                                """)
-                            with r_col2:
-                                st.markdown("#### 🧱 실제 차트 저항선 레이어")
-                                st.markdown(f"""
-                                * **직전 20일 전고점 저항**: `{q['high_20']:,}원` (매물 소화 점검선)
-                                * **돌파 확정 기준선**: `{q['breakout_price']:,}원` (+0.5% 상향 안착)
-                                * **52주 최고가 매물대**: `{q['high_52w']:,}원`
-                                """)
-
-                            # Gemini 브리핑 리포트 (키 존재 시에만 동작)
-                            if client:
-                                ai_prompt = f"""
-                                당신은 리서치 센터의 수석 퀀트 애널리스트입니다.
-                                제공된 정량 데이터를 기준으로 {verified_name}({target_code})의 매매 브리핑을 객관적으로 작성하세요.
-
-                                [확정 정량 데이터]
-                                - 종목명: {verified_name} ({target_code})
-                                - 현재가: {q['curr_price']:,}원 (20일선 이격도: {q['disp_display_str']}, RSI: {q['rsi_14']} [{q['rsi_desc']}])
-                                - 20일 평균 대비 거래량: {q['vol_ratio_20d']}배
-                                - 수급 데이터 신뢰도: {extra_data['data_confidence']}
-                                - ① Quality: {q['quality_score']}/100
-                                - ② Timing: {q['timing_score']}/100
-                                - ③ Risk: {q['risk_score']}/100 ({q['risk_label']})
-                                - ④ Trigger: {q['trigger_state']} (스코어: {q['trig_score']}/100점)
-                                - 현재 상태: {q['market_state']}
-                                - 눌림목 Buy Zone: {q['pullback_range']} (예상 진입 기준가: {q['target_entry']:,}원)
-                                - 초기 스윙 손절선: {q['stop_swing_init']}
-                                - 2R 익절 목표가: {q['target_2R']}
-                                - 직전 20일 전고점 저항선: {q['high_20']:,}원 (돌파 기준: {q['breakout_price']:,}원)
-
-                                [작성 규격]
-                                ### 1. Quad-Matrix 정량 평가 및 위치 진단
-                                ### 2. 거래량 및 가격 구조 객관적 해석
-                                ### 3. 조건부 매매 실행 시나리오
-                                ### 4. R-Multiple 익절 및 2단계 손절선 관리
-                                """
-
-                                with st.spinner("Gemini AI가 정밀 매매 실행 리포트를 작성하고 있습니다..."):
-                                    report_text = generate_content_with_retry(client, ai_prompt)
-                                    st.markdown(report_text)
-                            else:
-                                st.info("💡 사이드바에 Gemini API Key를 등록하면 AI 심층 분석 브리핑 리포트가 함께 생성됩니다.")
-
-                except Exception as e:
-                    st.error(f"분석 중 오류 발생: {e}")
+    if "screened_res" in st.session_state and not st.session_state["screened_res"].empty:
+        df_show = st.session_state["screened_res"]
+        st.dataframe(df_show, width='stretch')
+        
+        sel = st.selectbox("진단 탭으로 전송할 종목 선택", df_show["종목명"].tolist())
+        if st.button("선택 종목을 STEP 1으로 전송"):
+            st.session_state["selected_stock"] = sel
+            st.info(f"'{sel}' 선택 완료. **STEP 1** 탭으로 이동하세요.")
 
 # -------------------------------------------------------------
-# STEP 3: 사용 매뉴얼
+# TAB 3: 단일 종목 실계좌 MTM 백테스트
 # -------------------------------------------------------------
 with tab3:
-    st.subheader("📖 QUANT-EXECUTION 시스템 매뉴얼")
-    st.markdown("""
-    ### 💡 4대 독립 판단 체계 (Quad-Matrix)
-    * **① QUALITY (0~100점)**: 펀더멘털, 수급, 추세 등 종목 자체의 체력 평가
-    * **② TIMING (0~100점)**: 20일선 근접도 및 눌림목 적합도 (추격매수 패널티 부여)
-    * **③ RISK (0~100점)**: 과열도(RSI, 이격도) 및 저항 충돌 위험도
-    * **④ TRIGGER (ACTIVE / WATCH / WAIT / OFF)**: 기계적 진입 조건 충족 여부 (Buy Zone 내 2개 조건 충족 시 ACTIVE 분할 매수 가동)
+    st.subheader("단일 종목 일별 시가평가(Daily MTM) 실계좌 백테스트")
+    st.caption("3-Track 실제 체결, 부분익절 누적 현금흐름 완결 회계, Wilder ATR 및 진짜 일간 MDD를 반영합니다.")
+    st.info("※ 백테스트는 수급 데이터 비가용성을 감안하여 순수 가격·거래량 기반(has_frgn=False)으로 공정하게 검증됩니다.")
 
-    ### 🛑 2단계 리스크 관리
-    * **초기 구조적 손절선**: 진입 시점 기준 -1.5% ~ -3.0% 사전 설정 (호가 단위 보수적 내림 적용)
-    * **동적 트레일링 손절선**: 주가 상승 시 20일선 상향에 맞춰 손절선 동반 추종
+    bt_stock = st.text_input("백테스트 대상 종목명 또는 코드", value=st.session_state["selected_stock"])
+    c_b1, c_b2, c_b3 = st.columns(3)
+    with c_b1:
+        bt_init_cap = st.number_input("시뮬레이션 초기 자본금 (원)", value=30000000, step=5000000)
+    with c_b2:
+        bt_risk_pct = st.slider("1회 거래 리스크 비율 (%)", 0.5, 2.0, 1.0, step=0.1)
+    with c_b3:
+        bt_hold = st.slider("최대 허용 보유 기간 (Time Stop)", 5, 20, 10)
+
+    if st.button("일별 MTM 백테스트 가동", type="primary"):
+        with st.spinner(f"'{bt_stock}' 과거 2년 완결 회계 MTM 연산 중..."):
+            df_krx = load_krx_listing()
+            b_code, b_name = find_stock_code(bt_stock, df_krx)
+            if not b_code:
+                st.error("종목을 찾을 수 없습니다.")
+            else:
+                s_date = (datetime.date.today() - datetime.timedelta(days=730)).strftime("%Y-%m-%d")
+                df_bt = fdr.DataReader(b_code, s_date)
+                dual_hist = load_historical_dual_regime(s_date)
+                
+                daily_df, trades_df, met = run_daily_mtm_backtest(
+                    df_bt, dual_hist, max_holding=bt_hold,
+                    initial_capital=bt_init_cap, risk_pct=bt_risk_pct
+                )
+
+                if daily_df.empty:
+                    st.warning("과거 2년간 모든 엄격한 필터를 통과한 거래가 없습니다.")
+                else:
+                    st.markdown(f"### 📊 '{b_name}'({b_code}) 일별 MTM 실계좌 성과 요약")
+                    
+                    k1, k2, k3, k4 = st.columns(4)
+                    k1.metric("최종 계좌 잔고", f"{met['final_equity']:,}원", f"{met['total_return_pct']:+}%")
+                    k2.metric("진짜 일간 MDD", f"-{met['true_daily_mdd']}%", "미실현 손실 포함", delta_color="inverse")
+                    k3.metric("Profit Factor (원화 기준)", f"{met['profit_factor']}")
+                    k4.metric("거래당 기댓값 (Expectancy)", f"{met['expectancy_krw']:,}원")
+
+                    k5, k6, k7, k8 = st.columns(4)
+                    k5.metric("승률 (순익 > 0)", f"{met['win_rate']}%", f"총 {met['total_trades']}회")
+                    k6.metric("T1 도달률 (+1.0R)", f"{met['t1_rate']}%")
+                    k7.metric("T2 도달률 (+2.0R)", f"{met['t2_rate']}%")
+                    k8.metric("초기 투자 자본금", f"{bt_init_cap:,}원")
+
+                    st.line_chart(daily_df['Total_Equity'])
+
+                    st.markdown("#### 📋 완료된 매매 내역 (원화 정밀 회계)")
+                    st.dataframe(trades_df, width='stretch')
+
+# -------------------------------------------------------------
+# TAB 4: 다종목 포트폴리오 시뮬레이터 (동일 엔진 완결)
+# -------------------------------------------------------------
+with tab4:
+    st.subheader("다종목 동시 보유 포트폴리오 시뮬레이터 (Portfolio MTM)")
+    st.caption("복수 종목 바스켓에서 동시 신호 발생 시 점수 순으로 슬롯을 배정하고 3-Track 및 동적 Trailing을 100% 동일하게 검증합니다.")
+
+    default_tickers = "005930, 000660, 005380, 035420"
+    basket_input = st.text_input("포트폴리오 바스켓 (종목명 또는 코드, 콤마 구분)", value=default_tickers)
+    
+    cp1, cp2, cp3 = st.columns(3)
+    with cp1:
+        port_capital = st.number_input("포트폴리오 초기 총자산 (원)", value=50000000, step=10000000)
+    with cp2:
+        max_slots = st.slider("동시 최대 보유 종목 수 (슬롯)", 2, 5, 3)
+    with cp3:
+        port_risk = st.slider("종목당 허용 리스크 (%)", 0.5, 1.5, 1.0, step=0.1)
+
+    if st.button("포트폴리오 백테스트 실행", type="primary"):
+        with st.spinner("다종목 3-Track & Trailing 동시 자본 배분 시뮬레이션 중..."):
+            tickers = [t.strip() for t in basket_input.split(",") if t.strip()]
+            df_krx = load_krx_listing()
+            s_date = (datetime.date.today() - datetime.timedelta(days=730)).strftime("%Y-%m-%d")
+            dual_hist = load_historical_dual_regime(s_date)
+            
+            p_df, p_trades, p_met = run_portfolio_backtest(
+                tickers, dual_hist, df_krx=df_krx, max_positions=max_slots,
+                initial_capital=port_capital, risk_pct=port_risk
+            )
+
+            if p_df.empty:
+                st.warning("포트폴리오 진입 조건을 만족한 거래가 없습니다.")
+            else:
+                st.markdown("### 📊 다종목 포트폴리오 운용 성과")
+                pk1, pk2, pk3, pk4 = st.columns(4)
+                pk1.metric("포트폴리오 최종 잔고", f"{p_met['final_equity']:,}원", f"{p_met['return_pct']:+}%")
+                pk2.metric("포트폴리오 진짜 MDD", f"-{p_met['mdd_pct']}%", delta_color="inverse")
+                pk3.metric("Profit Factor", f"{p_met['profit_factor']}")
+                pk4.metric("거래당 기댓값", f"{p_met['expectancy_krw']:,}원")
+
+                st.line_chart(p_df['Total_Equity'])
+                st.markdown("#### 📋 포트폴리오 체결 내역 (동일 엔진 완결)")
+                st.dataframe(p_trades, width='stretch')
+
+# -------------------------------------------------------------
+# TAB 5: 시스템 무결성 헌장
+# -------------------------------------------------------------
+with tab5:
+    st.subheader("📖 QUANT-EXECUTION 무결성 실행 원칙")
+    st.markdown("""
+    1. **단일/포트폴리오 엔진 완전 일치 (Unified Core Execution)**:
+       * 단일 종목 백테스트와 다종목 포트폴리오 백테스트는 오직 `check_3track_execution`과 `process_intraday_position` 공통 함수만을 공유합니다.
+       * 3-Track 진입 체결부터 +1.5R/+2.0R 이익보호, 1.5 ATR Trailing, Trend Break 청산까지 완전히 동일하게 작동합니다.
+    2. **다단계 분할 회계 원칙 (True Cash Flow Accounting)**:
+       * 최종 청산 가격으로 전체 수익률을 왜곡하지 않고, $T_1(30\%)$, $T_2(40\%)$, 잔여분의 실제 매도 유입 현금을 각각 집계하여 원화 기준의 순수익과 손익비를 계산합니다.
+    3. **손절선 왜곡 금지 (Uncompromised Stop Loss)**:
+       * 손절선을 인위적인 범위(-2.5% ~ -7.5%)로 좁히지 않고 진짜 구조적 지지선에 배치하며, 리스크는 오직 포지션 수량 축소로 통제합니다.
+    4. **과거 듀얼 Regime 동기화 (Dual Regime Integrity)**:
+       * KOSPI와 KOSDAQ 양대 지수를 동시 추적하여 과거 시계열에서도 실전과 동일한 시장 위험 차단 기준을 적용합니다.
+    5. **호가 단위 및 상태 무결성 (Tick & State Safety)**:
+       * 최신 KRX 호가 규정을 엄격히 준수하며, 포지션 종료 시 진입일자 등 상태 변수를 안전하게 캐싱하여 로그 오염을 방지합니다.
     """)
