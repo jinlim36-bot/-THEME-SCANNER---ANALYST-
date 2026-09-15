@@ -19,7 +19,7 @@ logger = logging.getLogger("QuantExecutionFinal")
 
 MODEL_CANDIDATES = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
 
-# 2023년 개정 KRX 공식 호가 단위 (p <= threshold 기준)
+# 2023년 개정 KRX 공식 호가 단위 (p <= threshold 기준 경계값 일치)
 KOREA_TICK_TABLE = [
     (2000, 1),
     (5000, 5),
@@ -95,7 +95,7 @@ def ceil_to_tick(price):
     return int(math.ceil(p / t) * t)
 
 # -------------------------------------------------------------
-# 2. 보조 지표 계산 함수군 (Wilder ATR & 거래대금 정제)
+# 2. 보조 지표 계산 함수군 (Wilder ATR & 정제 거래대금)
 # -------------------------------------------------------------
 def calculate_wilder_atr(df, period=14):
     if len(df) < period + 1: return 0.0
@@ -114,7 +114,7 @@ def get_clean_avg_volume(volume_series, lookback=20):
     return 1.0
 
 def get_clean_avg_amount(df_slice, lookback=20):
-    """제공된 Amount 컬럼 우선 사용, 부재 시 Close * Volume으로 fallback"""
+    """제공된 Amount 컬럼 우선 사용, 결측 시 Close * Volume 대체"""
     if 'Amount' in df_slice.columns and not df_slice['Amount'].iloc[-lookback*2:-1].isnull().all() and (df_slice['Amount'].iloc[-lookback*2:-1] > 0).any():
         amt_series = df_slice['Amount'].iloc[-lookback*2:-1]
     else:
@@ -265,7 +265,7 @@ def get_supply_data(code):
     return res_data
 
 # -------------------------------------------------------------
-# 5. [100점 Entry Score] 상대강도 인덱스 보정 엔진
+# 5. [100점 Entry Score] 20거래일 인덱스 보정 엔진
 # -------------------------------------------------------------
 def calculate_100p_score(df_slice, kospi_slice=None, has_frgn=False):
     if len(df_slice) < 25:
@@ -380,7 +380,7 @@ def calculate_100p_score(df_slice, kospi_slice=None, has_frgn=False):
     }
 
 # -------------------------------------------------------------
-# 6. 가격선 설계 & 손절폭 과도 필터
+# 6. 가격선 설계 & 과도 손절폭 필터
 # -------------------------------------------------------------
 def calculate_execution_levels(df_slice, entry_price):
     atr14 = calculate_wilder_atr(df_slice, 14)
@@ -394,7 +394,6 @@ def calculate_execution_levels(df_slice, entry_price):
     stop_trend = ma20 * 0.97
     candidate_stop = min(stop_atr, stop_struct, stop_trend)
 
-    # 최소 1.2 ATR 거리 보장
     min_dist_price = curr_p - (1.2 * atr14)
     final_stop_val = min(candidate_stop, min_dist_price)
     
@@ -462,7 +461,7 @@ def calculate_position_sizing(account_capital, risk_pct, exec_multiplier, curr_p
 
     final_shares = max(0, min(raw_shares, max_liq_shares, max_weight_shares))
     total_invest = final_shares * curr_price
-    weight_pct = round((total_invest / account_capital) * 100, 1)
+    weight_pct = round((total_invest / account_capital) * 100, 1) if account_capital > 0 else 0.0
 
     normal_risk_loss = final_shares * risk_1r
     worst_gap_loss = final_shares * (risk_1r + int(1.0 * atr14))
@@ -474,10 +473,9 @@ def calculate_position_sizing(account_capital, risk_pct, exec_multiplier, curr_p
     }
 
 # -------------------------------------------------------------
-# 7. [공통 코어] 3-Track 진입 판정 & 일중 청산 관리 통합 엔진
+# 7. [공통 코어] 3-Track 체결 및 일중 포지션 라이프사이클 관리기
 # -------------------------------------------------------------
 def check_3track_execution(track, b_open, b_high, b_low, ma20_entry, high_20):
-    """단일 종목 및 포트폴리오 백테스트에서 100% 동일하게 호출되는 3-Track 체결 판정기"""
     if b_open <= 0: return False, 0.0
 
     if track == "MARKET":
@@ -498,11 +496,6 @@ def check_3track_execution(track, b_open, b_high, b_low, ma20_entry, high_20):
     return False, 0.0
 
 def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_holding=10, sell_fee=0.0020):
-    """
-    단일 종목 및 포트폴리오에 100% 공통 적용되는 일중 포지션 라이프사이클 관리 엔진:
-    Gap Down -> 장중 Stop -> Trend Break -> T1(30%) & 본전스탑 & 당일급락 재검사 ->
-    1.5R 보호스탑 -> T2(40%) & +1R 보호스탑 -> 고점대비 1.5 ATR Trailing -> T3 -> Time Stop
-    """
     b_open = float(bar['Open'])
     b_high = float(bar['High'])
     b_low = float(bar['Low'])
@@ -581,7 +574,6 @@ def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_hol
             exit_event = "TIME_STOP"
             exit_price = b_close
 
-    # 완전 청산 시 실현손익 확정
     if exit_event is not None:
         rem_shares = pos["shares"]
         final_gain = rem_shares * exit_price * (1.0 - sell_fee)
@@ -690,7 +682,7 @@ def run_daily_mtm_backtest(df_hist, df_dual_regime, max_holding=10, initial_capi
                 closed_trades.append(trade_rec)
 
         # ---------------------------------------------------------
-        # C. 일별 시가평가(MTM)
+        # C. 일별 시가평가 (MTM Close-to-Close)
         # ---------------------------------------------------------
         holding_val = (active_pos["shares"] * b_close) if active_pos is not None else 0.0
         tot_equity = cash + holding_val
@@ -724,7 +716,7 @@ def run_daily_mtm_backtest(df_hist, df_dual_regime, max_holding=10, initial_capi
 
     daily_df['Peak'] = daily_df['Total_Equity'].cummax()
     daily_df['Drawdown_pct'] = ((daily_df['Total_Equity'] - daily_df['Peak']) / daily_df['Peak']) * 100.0
-    true_daily_mdd = round(abs(daily_df['Drawdown_pct'].min()), 2)
+    daily_mdd = round(abs(daily_df['Drawdown_pct'].min()), 2)
     tot_ret_pct = round(((daily_df['Total_Equity'].iloc[-1] - initial_capital) / initial_capital) * 100.0, 2)
 
     if not trades_df.empty:
@@ -741,7 +733,7 @@ def run_daily_mtm_backtest(df_hist, df_dual_regime, max_holding=10, initial_capi
     metrics = {
         "final_equity": int(daily_df['Total_Equity'].iloc[-1]),
         "total_return_pct": tot_ret_pct,
-        "true_daily_mdd": true_daily_mdd,
+        "daily_mdd": daily_mdd,
         "profit_factor": profit_factor,
         "expectancy_krw": expectancy_krw,
         "win_rate": win_rate,
@@ -753,7 +745,7 @@ def run_daily_mtm_backtest(df_hist, df_dual_regime, max_holding=10, initial_capi
     return daily_df, trades_df, metrics
 
 # -------------------------------------------------------------
-# 9. [포트폴리오 바스켓] 다종목 동시 자본 배분 시뮬레이터 (엔진 완전 일치)
+# 9. [포트폴리오 바스켓] 다종목 동시 자본 배분 시뮬레이터 (P1 수정 완료)
 # -------------------------------------------------------------
 def run_portfolio_backtest(ticker_list, df_dual_regime, df_krx=None, max_positions=3, max_holding=10, initial_capital=50000000, risk_pct=1.0):
     s_date = (datetime.date.today() - datetime.timedelta(days=730)).strftime("%Y-%m-%d")
@@ -796,7 +788,7 @@ def run_portfolio_backtest(ticker_list, df_dual_regime, df_krx=None, max_positio
         cur_date_str = cur_date.strftime("%Y-%m-%d")
 
         # ---------------------------------------------------------
-        # 1. 3-Track 진입 실행 (점수 높은 순서로 슬롯 배정)
+        # 1. 3-Track 진입 실행 (P1: 전체 포트폴리오 총자산 기준 리스크 사이징)
         # ---------------------------------------------------------
         if pending_signals and len(positions) < max_positions:
             pending_signals.sort(key=lambda x: x["score"], reverse=True)
@@ -817,10 +809,19 @@ def run_portfolio_backtest(ticker_list, df_dual_regime, df_krx=None, max_positio
                 plan = calculate_execution_levels(df_code.iloc[:-1], e_price)
                 if plan["is_excessive_stop"]: continue
 
-                avail_cash = cash / (max_positions - len(positions))
+                # [P1 버그 해결]: 슬롯당 분할현금이 아닌 '현재 포트폴리오 총평가자산' 기준 리스크 1% 및 비중 30% 산출
+                stk_val_now = sum(p["shares"] * float(data_dict[c].loc[cur_date, 'Open']) for c, p in positions.items())
+                current_total_equity = cash + stk_val_now
+                
                 clean_amt = get_clean_avg_amount(df_code.iloc[:-1], 20)
-                pos_calc = calculate_position_sizing(avail_cash, risk_pct, item["multiplier"], e_price, plan["risk_1r"], plan["atr14"], clean_amt)
-                shares = pos_calc["shares"]
+                pos_calc = calculate_position_sizing(
+                    current_total_equity, risk_pct, item["multiplier"], e_price, plan["risk_1r"], plan["atr14"], clean_amt
+                )
+                target_shares = pos_calc["shares"]
+
+                # 가용 현금(cash) 한도를 최종 안전 상한으로 적용
+                max_cash_shares = int(cash // (e_price * (1.0 + buy_fee)))
+                shares = min(target_shares, max_cash_shares)
                 req_cash = shares * e_price * (1.0 + buy_fee)
 
                 if shares > 0 and cash >= req_cash:
@@ -870,7 +871,7 @@ def run_portfolio_backtest(ticker_list, df_dual_regime, df_krx=None, max_positio
         for c in closed_codes: del positions[c]
 
         # ---------------------------------------------------------
-        # 3. MTM 일별 시가평가
+        # 3. MTM 일별 시가평가 (Close-to-Close)
         # ---------------------------------------------------------
         stk_val = sum(p["shares"] * float(data_dict[c].loc[cur_date, 'Close']) for c, p in positions.items())
         daily_records.append({
@@ -921,7 +922,7 @@ def run_portfolio_backtest(ticker_list, df_dual_regime, df_krx=None, max_positio
     metrics = {
         "final_equity": int(port_df['Total_Equity'].iloc[-1]),
         "return_pct": p_ret,
-        "mdd_pct": p_mdd,
+        "daily_mdd": p_mdd,
         "profit_factor": p_pf,
         "expectancy_krw": p_exp,
         "win_rate": p_win,
@@ -1116,7 +1117,7 @@ with tab2:
 # -------------------------------------------------------------
 with tab3:
     st.subheader("단일 종목 일별 시가평가(Daily MTM) 실계좌 백테스트")
-    st.caption("3-Track 실제 체결, 부분익절 누적 현금흐름 완결 회계, Wilder ATR 및 진짜 일간 MDD를 반영합니다.")
+    st.caption("3-Track 실제 체결, 부분익절 누적 현금흐름 완결 회계, Wilder ATR 및 일별 종가 MTM MDD를 반영합니다.")
     st.info("※ 백테스트는 수급 데이터 비가용성을 감안하여 순수 가격·거래량 기반(has_frgn=False)으로 공정하게 검증됩니다.")
 
     bt_stock = st.text_input("백테스트 대상 종목명 또는 코드", value=st.session_state["selected_stock"])
@@ -1151,7 +1152,7 @@ with tab3:
                     
                     k1, k2, k3, k4 = st.columns(4)
                     k1.metric("최종 계좌 잔고", f"{met['final_equity']:,}원", f"{met['total_return_pct']:+}%")
-                    k2.metric("진짜 일간 MDD", f"-{met['true_daily_mdd']}%", "미실현 손실 포함", delta_color="inverse")
+                    k2.metric("일별 종가 MTM MDD", f"-{met['daily_mdd']}%", "Close-to-Close 낙폭", delta_color="inverse")
                     k3.metric("Profit Factor (원화 기준)", f"{met['profit_factor']}")
                     k4.metric("거래당 기댓값 (Expectancy)", f"{met['expectancy_krw']:,}원")
 
@@ -1167,11 +1168,11 @@ with tab3:
                     st.dataframe(trades_df, width='stretch')
 
 # -------------------------------------------------------------
-# TAB 4: 다종목 포트폴리오 시뮬레이터 (동일 엔진 완결)
+# TAB 4: 다종목 포트폴리오 시뮬레이터 (P1 수정 완료)
 # -------------------------------------------------------------
 with tab4:
     st.subheader("다종목 동시 보유 포트폴리오 시뮬레이터 (Portfolio MTM)")
-    st.caption("복수 종목 바스켓에서 동시 신호 발생 시 점수 순으로 슬롯을 배정하고 3-Track 및 동적 Trailing을 100% 동일하게 검증합니다.")
+    st.caption("전체 계좌 자산 기준 1% 리스크 사이징, 점수 순 슬롯 배정 및 3-Track과 동적 Trailing을 완전 일치 검증합니다.")
 
     default_tickers = "005930, 000660, 005380, 035420"
     basket_input = st.text_input("포트폴리오 바스켓 (종목명 또는 코드, 콤마 구분)", value=default_tickers)
@@ -1182,10 +1183,10 @@ with tab4:
     with cp2:
         max_slots = st.slider("동시 최대 보유 종목 수 (슬롯)", 2, 5, 3)
     with cp3:
-        port_risk = st.slider("종목당 허용 리스크 (%)", 0.5, 1.5, 1.0, step=0.1)
+        port_risk = st.slider("종목당 허용 리스크 (%)", 0.5, 1.5, 1.0, step=0.1, help="포트폴리오 전체 총자산 대비 1회 허용 손실 비율")
 
     if st.button("포트폴리오 백테스트 실행", type="primary"):
-        with st.spinner("다종목 3-Track & Trailing 동시 자본 배분 시뮬레이션 중..."):
+        with st.spinner("다종목 전체자산 기준 사이징 & 3-Track 동시 시뮬레이션 중..."):
             tickers = [t.strip() for t in basket_input.split(",") if t.strip()]
             df_krx = load_krx_listing()
             s_date = (datetime.date.today() - datetime.timedelta(days=730)).strftime("%Y-%m-%d")
@@ -1202,7 +1203,7 @@ with tab4:
                 st.markdown("### 📊 다종목 포트폴리오 운용 성과")
                 pk1, pk2, pk3, pk4 = st.columns(4)
                 pk1.metric("포트폴리오 최종 잔고", f"{p_met['final_equity']:,}원", f"{p_met['return_pct']:+}%")
-                pk2.metric("포트폴리오 진짜 MDD", f"-{p_met['mdd_pct']}%", delta_color="inverse")
+                pk2.metric("일별 종가 MTM MDD", f"-{p_met['daily_mdd']}%", "Close-to-Close", delta_color="inverse")
                 pk3.metric("Profit Factor", f"{p_met['profit_factor']}")
                 pk4.metric("거래당 기댓값", f"{p_met['expectancy_krw']:,}원")
 
@@ -1211,7 +1212,7 @@ with tab4:
                 st.dataframe(p_trades, width='stretch')
 
 # -------------------------------------------------------------
-# TAB 5: 시스템 무결성 헌장
+# TAB 5: 시스템 무결성 헌장 (P3 정합성 수정 완료)
 # -------------------------------------------------------------
 with tab5:
     st.subheader("📖 QUANT-EXECUTION 무결성 실행 원칙")
@@ -1219,12 +1220,12 @@ with tab5:
     1. **단일/포트폴리오 엔진 완전 일치 (Unified Core Execution)**:
        * 단일 종목 백테스트와 다종목 포트폴리오 백테스트는 오직 `check_3track_execution`과 `process_intraday_position` 공통 함수만을 공유합니다.
        * 3-Track 진입 체결부터 +1.5R/+2.0R 이익보호, 1.5 ATR Trailing, Trend Break 청산까지 완전히 동일하게 작동합니다.
-    2. **다단계 분할 회계 원칙 (True Cash Flow Accounting)**:
+    2. **전체 자산 기준 리스크 사이징 (Portfolio Equity Risk Basis)**:
+       * 포트폴리오 백테스트 시 슬롯 배분 현금이 아닌 현재 포트폴리오 전체 총평가자산을 기준으로 1% 리스크와 단일 종목 30% 비중 상한을 계산하여 현실적 자본 할당을 구현합니다.
+    3. **다단계 분할 회계 원칙 (True Cash Flow Accounting)**:
        * 최종 청산 가격으로 전체 수익률을 왜곡하지 않고, $T_1(30\%)$, $T_2(40\%)$, 잔여분의 실제 매도 유입 현금을 각각 집계하여 원화 기준의 순수익과 손익비를 계산합니다.
-    3. **손절선 왜곡 금지 (Uncompromised Stop Loss)**:
-       * 손절선을 인위적인 범위(-2.5% ~ -7.5%)로 좁히지 않고 진짜 구조적 지지선에 배치하며, 리스크는 오직 포지션 수량 축소로 통제합니다.
-    4. **과거 듀얼 Regime 동기화 (Dual Regime Integrity)**:
-       * KOSPI와 KOSDAQ 양대 지수를 동시 추적하여 과거 시계열에서도 실전과 동일한 시장 위험 차단 기준을 적용합니다.
-    5. **호가 단위 및 상태 무결성 (Tick & State Safety)**:
-       * 최신 KRX 호가 규정을 엄격히 준수하며, 포지션 종료 시 진입일자 등 상태 변수를 안전하게 캐싱하여 로그 오염을 방지합니다.
+    4. **정합적 손절 통제 원칙 (Harmonized Risk Defense)**:
+       * 손절선을 인위적인 범위(-2.5% ~ -7.5%)로 왜곡하지 않고 실제 구조/변동성 지지선에 정확히 배치하며, 리스크는 포지션 수량 조절을 최우선으로 하되 손절폭이 -8.5%를 초과하는 종목은 거래 자체를 거부(WAIT)하여 자본 회전율을 방어합니다.
+    5. **일별 종가 MTM 평가 기준 (Close-to-Close MTM Transparency)**:
+       * 백테스트의 MDD 및 자산 곡선은 거래 종료 시점 기준이 아닌 매일 장 마감 종가 기준의 시가평가(MTM)로 측정되며, 장중 틱 단위 미세 낙폭은 배제된 일봉 기준 지표임을 명확히 규정합니다.
     """)
