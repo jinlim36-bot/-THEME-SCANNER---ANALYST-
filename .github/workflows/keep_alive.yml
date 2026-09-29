@@ -1,0 +1,51 @@
+name: Keep Streamlit Alive
+
+on:
+  schedule:
+    # 6시간마다 실행 (하루 4회)
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  wake-streamlit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install chromium
+
+      - name: Visit and Wake App
+        run: |
+          python - << 'EOF'
+          from playwright.sync_api import sync_playwright
+
+          APP_URL = "https://<본인-앱-주소>.streamlit.app"
+
+          with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            
+            print(f"Connecting to {APP_URL}...")
+            page.goto(APP_URL, timeout=90000)
+            
+            # 페이지 로드 및 웹소켓 연결 대기
+            page.wait_for_timeout(10000)
+            
+            # 슬립 상태일 경우 나타나는 'Wake' 버튼 감지 및 클릭
+            wake_buttons = page.locator("button:has-text('Yes, get this app back up')")
+            if wake_buttons.count() > 0:
+                print("App is asleep. Clicking wake-up button...")
+                wake_buttons.first.click()
+                page.wait_for_timeout(15000)
+                print("Wake-up request sent!")
+            else:
+                print("App is already awake. Session renewed.")
+                
+            browser.close()
+          EOF
