@@ -25,7 +25,7 @@ jobs:
           python - << 'EOF'
           from playwright.sync_api import sync_playwright
 
-          APP_URL = "https://<본인-앱-주소>.streamlit.app"
+          APP_URL = "https://6svx4nrcbslgxbczwkzvnm.streamlit.app"
 
           with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
