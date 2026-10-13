@@ -81,6 +81,8 @@ class EngineTests(unittest.TestCase):
         self.assertGreaterEqual(daily.Cash.min(), 0)
         self.assertLessEqual(daily.Num_Positions.max(), 3)
         self.assertEqual(metrics['total_trades'], len(trades))
+        self.assertLessEqual(metrics['max_entry_stop_risk_pct'], 3.0 + 1e-9)
+        self.assertTrue((daily.New_Entry_Stop_Risk_pct.dropna() <= 3.0 + 1e-9).all())
 
     def test_tick_boundaries(self):
         tick = self.e['get_tick_size']
@@ -105,7 +107,7 @@ class EngineTests(unittest.TestCase):
         score, _ = self.e['calculate_3tier_rs'](data, market, sector)
         self.assertEqual(score, 10)
         score2, _ = self.e['calculate_3tier_rs'](data, market.iloc[:10], sector)
-        self.assertEqual(score2, 5)
+        self.assertEqual(score2, 0)
 
     def test_evaluation_dates_and_empty_range(self):
         start = self.df.index[100]
@@ -177,7 +179,7 @@ class EngineTests(unittest.TestCase):
             # Equal daily returns should yield 100% WFE despite differing durations.
             rate = (1.001 ** len(days) - 1) * 100
             return (pd.DataFrame({'Total_Equity': 1}, index=days), pd.DataFrame(),
-                    {'total_trades': 4, 'profit_factor': 1.5, 'total_return_pct': rate})
+                    {'total_trades': 30, 'profit_factor': 1.5, 'total_return_pct': rate, 'daily_mdd': 2.0})
         self.e['run_daily_mtm_backtest'] = fake
         result = self.e['run_multidimensional_wfo'](self.df, self.reg)
         self.assertEqual(len(result), 4)
