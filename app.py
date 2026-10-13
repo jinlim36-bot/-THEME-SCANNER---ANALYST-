@@ -635,10 +635,17 @@ def limit_portfolio_entry(desired_shares, code, sector, entry_price, stop_price,
         return {'shares': 0, 'total_risk_pct': 0.0, 'limiting_factor': 'INVALID_STOP_RISK'}
     total_used = sector_used = correlated_used = 0.0
     for existing_code, position in positions.items():
-        mark = float(histories[existing_code].loc[date, 'Open'])
-        if position['entry_date'] == date.strftime('%Y-%m-%d'):
+        opening_price = float(histories[existing_code].loc[date, 'Open'])
+        entered_today = position['entry_date'] == date.strftime('%Y-%m-%d')
+        if entered_today:
+            # A position bought intraday did not exist at the earlier opening price.
             mark = position['entry_price'] * (1 + buy_fee)
-        stop_net = floor_to_tick(position['current_stop'] * (1 - market_slippage)) * (1 - sell_fee)
+            stop_basis = position['current_stop']
+        else:
+            mark = opening_price
+            # An overnight stop gapped through fills at the open, with costs.
+            stop_basis = min(opening_price, position['current_stop'])
+        stop_net = floor_to_tick(stop_basis * (1 - market_slippage)) * (1 - sell_fee)
         used = position['shares'] * max(0, mark - stop_net)
         total_used += used
         if position.get('sector', '대표지수') == sector:
@@ -812,12 +819,8 @@ def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_hol
     elif prioritize_stop and hit_stop_candidate:
         exit_event = "STOP_LOSS" if not pos["t1_hit"] else "TRAILING_STOP"
         exit_price = floor_to_tick(c_stop * (1.0 - market_slippage))
-    # 3. Trend Break
-    elif pos["t1_hit"] and (b_close < ma5_val) and (b_close < prev_low):
-        exit_event = "TREND_BREAK_EXIT"
-        exit_price = floor_to_tick(b_close * (1.0 - market_slippage))
     else:
-        # 4. T1 도달 (30%)
+        # 3. T1 도달 (30%)
         if not pos["t1_hit"] and b_high >= pos["t1"]:
             pos["t1_hit"] = True
             s_qty = min(int(pos["orig_shares"] * 0.30), cur_shares)
@@ -837,13 +840,13 @@ def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_hol
                 exit_event = "T1_THEN_BREAKEVEN"
                 exit_price = floor_to_tick(e_price * (1.0 - market_slippage))
 
-        # 5. 1.5R 도달 시 +0.5R 보호 스탑 상향
+        # 4. 1.5R 도달 시 +0.5R 보호 스탑 상향
         if exit_event is None and pos["t1_hit"] and not pos["t2_hit"]:
             r1 = pos["t1"] - e_price
             if b_high >= e_price + (1.5 * r1):
                 pos["current_stop"] = max(pos["current_stop"], floor_to_tick(e_price + 0.5 * r1))
 
-        # 6. T2 도달 (40%) & +1.0R 보호 스탑 상향
+        # 5. T2 도달 (40%) & +1.0R 보호 스탑 상향
         if exit_event is None and not pos["t2_hit"] and b_high >= pos["t2"]:
             pos["t2_hit"] = True
             s_qty = min(int(pos["orig_shares"] * 0.40), pos["shares"])
@@ -856,16 +859,21 @@ def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_hol
             r1 = pos["t1"] - e_price
             pos["current_stop"] = max(pos["current_stop"], floor_to_tick(e_price + 1.0 * r1))
 
-        # 7. T2 달성 후 고점 대비 trail_atr_mult ATR 다이내믹 트레일링
+        # 6. T2 달성 후 고점 대비 trail_atr_mult ATR 다이내믹 트레일링
         if exit_event is None and pos["t2_hit"]:
             dynamic_trail = floor_to_tick(pos["peak_price"] - (trail_atr_mult * pos["atr"]))
             pos["current_stop"] = max(pos["current_stop"], dynamic_trail)
 
-        # 8. T3 도달 (잔여 전량)
+        # 7. T3 도달 (잔여 전량)
         if exit_event is None and b_high >= pos["t3"]:
             pos["t3_hit"] = True
             exit_event = "TARGET_3R_FULL"
             exit_price = floor_to_tick(pos["t3"] * (1.0 - limit_slippage))
+        # 8. Closing exits occur after intraday target fills. Existing gap/stop
+        # priorities and the execution-mode ambiguity assumptions stay in force.
+        elif exit_event is None and pos["t1_hit"] and b_close < ma5_val and b_close < prev_low:
+            exit_event = "TREND_BREAK_EXIT"
+            exit_price = floor_to_tick(b_close * (1.0 - market_slippage))
         # 9. Time Stop
         elif exit_event is None and h_days >= max_holding:
             exit_event = "TIME_STOP"

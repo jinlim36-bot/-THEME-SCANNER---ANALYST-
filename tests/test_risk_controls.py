@@ -137,6 +137,51 @@ class RiskControlTests(unittest.TestCase):
             max_total_risk_pct=10, max_sector_risk_pct=10, max_correlated_risk_pct=1)
         self.assertEqual(result['shares'], 0)
 
+    def test_gap_exit_costs_are_reserved_in_all_three_risk_budgets(self):
+        date = self.df.index[200]
+        old = self.df.copy()
+        old.loc[date, ['Open', 'High', 'Low', 'Close']] = [9000, 9200, 8800, 9100]
+        new = self.df.copy()
+        new.loc[date, ['Open', 'High', 'Low', 'Close']] = [10000, 10100, 9900, 10000]
+        position = dict(shares=30, orig_shares=30, entry_price=10000, current_stop=9500,
+                        sector='반도체', entry_date='2024-01-01', t1=10500, t2=11000,
+                        t3=11500, t1_hit=False, t2_hit=False, t3_hit=False, holding_days=2,
+                        peak_price=10000, atr=100, cash_inflow=0, total_invested=300150, track='MARKET')
+        _, old_cash, old_trade = self.e['process_intraday_position'](
+            position.copy(), old.loc[date], 10000, 9900, date.strftime('%Y-%m-%d'))
+        self.assertEqual(old_trade['청산사유'], 'GAP_DOWN_STOP')
+        gap_cost = 30 * 9000 - old_cash
+        self.assertGreater(gap_cost, 0)
+        cases = [(3, 10, 10, 'PORTFOLIO_RISK_CAP'), (10, 3, 10, 'SECTOR_RISK_CAP'),
+                 (10, 10, 3, 'CORRELATION_RISK_CAP')]
+        for total, sector, correlated, binding in cases:
+            with self.subTest(binding=binding):
+                result = self.e['limit_portfolio_entry'](
+                    1000, 'new', '반도체', 10000, 9500, 1000000,
+                    {'old': position.copy()}, {'old': old, 'new': new}, date,
+                    max_total_risk_pct=total, max_sector_risk_pct=sector,
+                    max_correlated_risk_pct=correlated)
+                new_risk = result['shares'] * (10005 - 9490 * .998)
+                self.assertLessEqual(new_risk + gap_cost, 30000)
+                self.assertAlmostEqual(result['total_risk_pct'], (new_risk + gap_cost) / 1000000 * 100)
+                self.assertEqual(result['limiting_factor'], binding)
+                self.assertEqual(result['shares'], 54)
+
+    def test_same_day_intraday_entry_does_not_use_the_earlier_open_as_gap_exit(self):
+        date = self.df.index[200]
+        old = self.df.copy()
+        old.loc[date, ['Open', 'High', 'Low', 'Close']] = [9000, 12000, 8900, 11000]
+        position = dict(shares=30, entry_price=10000, current_stop=9500,
+                        sector='반도체', entry_date=date.strftime('%Y-%m-%d'))
+        result = self.e['limit_portfolio_entry'](
+            1000, 'new', '반도체', 10000, 9500, 1000000,
+            {'old': position}, {'old': old, 'new': self.df}, date,
+            max_total_risk_pct=3, max_sector_risk_pct=10, max_correlated_risk_pct=10)
+        expected_existing = 30 * (10005 - 9490 * .998)
+        expected_new = result['shares'] * (10005 - 9490 * .998)
+        self.assertAlmostEqual(result['total_risk_pct'], (expected_existing + expected_new) / 1000000 * 100)
+        self.assertLessEqual(expected_existing + expected_new, 30000)
+
     def test_profit_factor_does_not_invent_a_finite_ratio(self):
         no_losses = self.e['summarize_trades'](pd.DataFrame({'실현손익(원)': [100, 200]}))
         self.assertTrue(np.isinf(no_losses['profit_factor']))

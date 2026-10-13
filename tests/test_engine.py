@@ -170,6 +170,69 @@ class EngineTests(unittest.TestCase):
         self.assertIsNotNone(optimistic)
         self.assertIsNone(other)
 
+    def target_position(self, first_target_hit=True):
+        return dict(entry_price=10000, current_stop=10000 if first_target_hit else 9500,
+                    shares=70 if first_target_hit else 100, orig_shares=100,
+                    t1=10500, t2=11000, t3=11500, t1_hit=first_target_hit, t2_hit=False,
+                    t3_hit=False, holding_days=2, peak_price=10600 if first_target_hit else 10000,
+                    atr=100, cash_inflow=30 * 10490 * .998 if first_target_hit else 0,
+                    total_invested=1000500, entry_date='2024-01-01', track='MARKET')
+
+    def test_second_target_precedes_closing_trend_break_in_all_modes(self):
+        bar = dict(Open=10600, High=11200, Low=10300, Close=10300)
+        for mode in ['CONSERVATIVE', 'NEUTRAL', 'OPTIMISTIC']:
+            with self.subTest(mode=mode):
+                position = self.target_position()
+                closed, cash, trade = self.e['process_intraday_position'](
+                    position, bar, 10400, 10400, '2024-01-04', execution_mode=mode)
+                self.assertIsNone(closed)
+                self.assertTrue(trade['T2_달성'])
+                self.assertEqual(trade['청산사유'], 'TREND_BREAK_EXIT')
+                expected_cash = (40 * 10990 + 30 * 10280) * .998
+                self.assertAlmostEqual(cash, expected_cash)
+                self.assertEqual(trade['실현손익(원)'], int(30 * 10490 * .998 + cash - 1000500))
+
+    def test_first_target_can_precede_same_day_closing_trend_break(self):
+        bar = dict(Open=10400, High=10600, Low=10300, Close=10400)
+        closed, cash, trade = self.e['process_intraday_position'](
+            self.target_position(False), bar, 10450, 10500, '2024-01-04')
+        self.assertIsNone(closed)
+        self.assertTrue(trade['T1_달성'])
+        self.assertEqual(trade['청산사유'], 'TREND_BREAK_EXIT')
+        self.assertAlmostEqual(cash, (30 * 10490 + 70 * 10380) * .998)
+
+    def test_third_target_precedes_closing_trend_break(self):
+        bar = dict(Open=10600, High=11600, Low=10300, Close=10300)
+        closed, cash, trade = self.e['process_intraday_position'](
+            self.target_position(), bar, 10400, 10400, '2024-01-04')
+        self.assertIsNone(closed)
+        self.assertTrue(trade['T2_달성'])
+        self.assertTrue(trade['T3_달성'])
+        self.assertEqual(trade['청산사유'], 'TARGET_3R_FULL')
+        self.assertAlmostEqual(cash, (40 * 10990 + 30 * 11490) * .998)
+
+    def test_existing_stop_and_gap_keep_priority_over_targets(self):
+        bars = [(dict(Open=10600, High=11200, Low=9900, Close=10300), 'TRAILING_STOP'),
+                (dict(Open=9000, High=11600, Low=8900, Close=10300), 'GAP_DOWN_TRAILING')]
+        for bar, event in bars:
+            with self.subTest(event=event):
+                closed, _, trade = self.e['process_intraday_position'](
+                    self.target_position(), bar, 10400, 10400, '2024-01-04')
+                self.assertIsNone(closed)
+                self.assertFalse(trade['T2_달성'])
+                self.assertEqual(trade['청산사유'], event)
+
+    def test_second_target_precedes_closing_time_stop(self):
+        position = self.target_position()
+        position['holding_days'] = 9
+        bar = dict(Open=10600, High=11200, Low=10300, Close=11100)
+        closed, cash, trade = self.e['process_intraday_position'](
+            position, bar, 10500, 10400, '2024-01-04', max_holding=10)
+        self.assertIsNone(closed)
+        self.assertTrue(trade['T2_달성'])
+        self.assertEqual(trade['청산사유'], 'TIME_STOP')
+        self.assertAlmostEqual(cash, (40 * 10990 + 30 * 11080) * .998)
+
     def test_wfo_windows_parameters_and_daily_normalization(self):
         calls = []
         def fake(data, reg, **kwargs):
