@@ -10,6 +10,9 @@ import logging
 from bs4 import BeautifulSoup
 import FinanceDataReader as fdr
 from google import genai
+from google.genai import errors as genai_errors
+import httpx
+import re
 
 # =============================================================
 # [시스템 로깅 & 환경 설정]
@@ -19,16 +22,35 @@ logger = logging.getLogger("QuantExecutionProMax")
 
 MODEL_CANDIDATES = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
 
-# 2023년 개정 KRX 공식 호가 단위 (p <= threshold 기준 경계값 일치)
+# KRX 주식 호가 단위: 각 구간 상한은 미포함 (ETF/ETN에는 별도 규칙 적용)
 KOREA_TICK_TABLE = [
     (2000, 1),
     (5000, 5),
     (20000, 10),
-    (50000, 20),
+    (50000, 50),
     (200000, 100),
-    (500000, 200),
+    (500000, 500),
     (float('inf'), 1000)
 ]
+
+# 대표 섹터 ETF 맵핑 (3단 계층 상대강도 산출용)
+SECTOR_ETF_MAP = {
+    "반도체": "091160",      # KODEX 반도체
+    "2차전지": "305720",     # KODEX 2차전지산업
+    "바이오": "244580",      # KODEX 바이오
+    "자동차": "091180",      # KODEX 자동차
+    "IT/플랫폼": "229200",   # KODEX 코스닥150: IT 전용 ETF가 아닌 대용 지표
+    "대표지수": "069500"     # KODEX 200
+}
+
+# KRX 표준 산업 분류 -> 5대 주도 섹터 ETF 매핑 규칙
+KRX_INDUSTRY_KEYWORD_MAP = {
+    "반도체": "반도체",
+    "이차전지": "2차전지", "2차전지": "2차전지", "축전지": "2차전지",
+    "의약": "바이오", "바이오": "바이오", "약품": "바이오", "생물": "바이오",
+    "자동차": "자동차", "트레일러": "자동차",
+    "소프트웨어": "IT/플랫폼", "인터넷": "IT/플랫폼", "포털": "IT/플랫폼", "게임": "IT/플랫폼"
+}
 
 st.set_page_config(
     page_title="QUANT-EXECUTION PRO MAX: 완전 일치 실행 엔진",
@@ -47,6 +69,7 @@ except Exception:
     pass
 
 st.sidebar.header("⚙️ 시스템 설정")
+st.sidebar.caption("AI 진단 버전: AI-DIAG-2")
 input_key = st.sidebar.text_input("Gemini API Key", value=secret_key, type="password")
 active_key = input_key.strip() if input_key.strip() else secret_key
 
@@ -54,20 +77,102 @@ client = None
 if active_key:
     try:
         client = genai.Client(api_key=active_key)
-        st.sidebar.success("✅ AI 리스크 설명 데스크 활성화")
+        st.sidebar.info("🔑 API 키 입력됨 · 연결은 브리핑 요청 시 확인합니다.")
     except Exception as e:
         client = None
-        st.sidebar.warning(f"AI 비활성화 (순수 규칙 엔진만 가동): {e}")
+        st.sidebar.warning(f"AI 클라이언트 초기화 실패 ({type(e).__name__}). API 키 설정을 확인하세요.")
+
+def _safe_ai_error_message(message):
+    # SDK errors can contain request URLs or credentials; never expose them.
+    text = str(message or "")
+    if active_key:
+        text = text.replace(active_key, "[REDACTED]")
+    text = re.sub(r"AIza[\w-]+", "[REDACTED]", text)
+    text = re.sub(r"(?i)(key|api_key|x-goog-api-key|authorization)([\s:=]+)[^\s&,]+", r"\1\2[REDACTED]", text)
+    return text[:400]
+
+
+def _ai_response_reason(response):
+    if response is None:
+        return "응답 없음"
+    feedback = getattr(response, "prompt_feedback", None)
+    blocked = getattr(feedback, "block_reason", None)
+    reasons = []
+    if blocked:
+        reasons.append(f"프롬프트 차단: {getattr(blocked, 'value', blocked)}")
+    for candidate in getattr(response, "candidates", None) or []:
+        reason = getattr(candidate, "finish_reason", None)
+        if reason:
+            reasons.append(f"종료 사유: {getattr(reason, 'value', reason)}")
+    return "; ".join(reasons) or "텍스트 없는 응답"
+
 
 def generate_ai_briefing(client, prompt):
-    if not client: return ""
+    if not client:
+        return ""
+    failures = []
+    hints = {
+        400: "요청 내용·API 키·모델 옵션을 확인하세요.",
+        401: "API 키 인증을 확인하세요.",
+        403: "키의 프로젝트 권한과 API 접근 제한을 확인하세요.",
+        404: "해당 API에서 모델을 사용할 수 있는지 확인하세요.",
+        429: "프로젝트 할당량·요청 제한·결제 설정을 확인하세요.",
+        500: "Gemini 서버 오류입니다. 잠시 후 다시 시도하세요.",
+        503: "Gemini가 일시적으로 응답할 수 없습니다. 잠시 후 다시 시도하세요.",
+    }
     for model_name in MODEL_CANDIDATES:
         try:
             res = client.models.generate_content(model=model_name, contents=prompt)
-            if res and res.text: return res.text
-        except Exception:
-            continue
-    return "AI 브리핑을 생성할 수 없습니다."
+            text = res.text if res else None
+            if text and text.strip():
+                st.caption(f"Gemini 응답 성공 · 모델: {model_name}")
+                return text
+            detail = _ai_response_reason(res)
+        except genai_errors.APIError as error:
+            detail = f"API 오류 {error.code}: {_safe_ai_error_message(error.message)}"
+            detail += " " + hints.get(error.code, "API 오류 내용을 확인하세요.")
+        except httpx.ProxyError:
+            detail = "ProxyError: Gemini 요청의 프록시 연결이 실패했습니다. 환경 네트워크 설정을 확인하세요."
+        except httpx.TimeoutException:
+            detail = "Timeout: Gemini 응답 대기 시간이 초과됐습니다."
+        except httpx.TransportError as error:
+            detail = f"{type(error).__name__}: 네트워크·TLS 연결을 확인하세요."
+        except Exception as error:
+            detail = f"{type(error).__name__}: AI 요청 처리 중 예기치 않은 오류가 발생했습니다."
+        detail = _safe_ai_error_message(detail)
+        logger.warning("Gemini briefing failed [%s]: %s", model_name, detail)
+        failures.append(f"{model_name}: {detail}")
+    st.warning("AI 브리핑 요청 실패. 아래 모델별 진단을 확인하세요.")
+    with st.expander("AI 브리핑 실패 진단", expanded=True):
+        for failure in failures:
+            st.text(failure)
+    return "AI 브리핑을 생성할 수 없습니다.\n\n진단 버전: AI-DIAG-2\n\n" + "\n\n".join(failures)
+
+@st.cache_data(ttl=3600)
+def load_price_history(symbol, start_date):
+    try:
+        data = fdr.DataReader(symbol, start_date)
+        if data is None or data.empty:
+            return pd.DataFrame()
+        data = data.copy()
+        data.index = pd.to_datetime(data.index).normalize()
+        return data.loc[~data.index.duplicated(keep="last")].sort_index()
+    except Exception as error:
+        logger.warning("Price data unavailable [%s]: %s", symbol, type(error).__name__)
+        st.warning(f"{symbol} 시세 조회 실패 ({type(error).__name__}). 데이터 제공처와 네트워크 설정을 확인하세요.")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def load_stock_listing(market):
+    try:
+        data = fdr.StockListing(market)
+        return data if data is not None else pd.DataFrame()
+    except Exception as error:
+        logger.warning("Stock listing unavailable [%s]: %s", market, type(error).__name__)
+        st.warning(f"{market} 종목 목록 조회 실패 ({type(error).__name__}).")
+        return pd.DataFrame()
+
 
 # -------------------------------------------------------------
 # 1. 호가 단위 및 가격 헬퍼
@@ -76,7 +181,7 @@ def get_tick_size(price):
     try:
         p = abs(float(price))
         for threshold, tick in KOREA_TICK_TABLE:
-            if p <= threshold:
+            if p < threshold:
                 return tick
     except (ValueError, TypeError):
         return 1
@@ -97,8 +202,29 @@ def ceil_to_tick(price):
 # -------------------------------------------------------------
 # 2. 보조 지표 계산 함수군 (Wilder ATR & 정제 거래대금)
 # -------------------------------------------------------------
+def prepare_engine_history(df):
+    """Compute causal indicators once; every row depends only on earlier rows."""
+    if '_engine_atr14' in df.columns:
+        return df
+    result = df.copy()
+    close = result['Close']
+    result['_engine_ma5'] = close.rolling(5).mean()
+    result['_engine_ma20'] = close.rolling(20).mean()
+    result['_engine_ma20_prev5'] = result['_engine_ma20'].shift(5)
+    result['_engine_ma60'] = close.rolling(60).mean()
+    previous = close.shift(1)
+    tr = pd.concat([result['High'] - result['Low'],
+                    (result['High'] - previous).abs(),
+                    (result['Low'] - previous).abs()], axis=1).max(axis=1)
+    result['_engine_atr14'] = tr.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    return result
+
+
 def calculate_wilder_atr(df, period=14):
     if len(df) < period + 1: return 0.0
+    if period == 14 and "_engine_atr14" in df.columns:
+        atr = df["_engine_atr14"].iloc[-1]
+        return float(atr) if pd.notna(atr) else 0.0
     high, low, close_prev = df['High'], df['Low'], df['Close'].shift(1)
     tr = pd.concat([high - low, (high - close_prev).abs(), (low - close_prev).abs()], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1.0/period, min_periods=period, adjust=False).mean().iloc[-1]
@@ -131,8 +257,8 @@ def get_clean_avg_amount(df_slice, lookback=20):
 @st.cache_data(ttl=3600)
 def load_historical_dual_regime(start_date="2022-01-01"):
     try:
-        df_ks = fdr.DataReader('KS11', start_date)
-        df_kq = fdr.DataReader('KQ11', start_date)
+        df_ks = load_price_history('KS11', start_date)
+        df_kq = load_price_history('KQ11', start_date)
         if df_ks is None or df_kq is None or len(df_ks) < 30:
             return pd.DataFrame()
 
@@ -177,7 +303,7 @@ def get_current_dual_regime():
     df_dual = load_historical_dual_regime((datetime.date.today() - datetime.timedelta(days=90)).strftime('%Y-%m-%d'))
     if df_dual.empty:
         return {"status": "NEUTRAL", "code": "NEUTRAL", "multiplier": 0.5, "msg": "시장 지수 수신 지연"}
-    
+
     last = df_dual.iloc[-1]
     regime = last['Regime']
     if regime == "FAVORABLE":
@@ -188,7 +314,7 @@ def get_current_dual_regime():
         return {"status": "NEUTRAL (경계/혼조 국면)", "code": "NEUTRAL", "multiplier": 0.5, "msg": "양대 시장 혼조세. 신규 매수 시 비중을 50%로 축소 집행합니다."}
 
 # -------------------------------------------------------------
-# 4. 데이터 로더 & 과거 외국인 수급 일별 시계열 크롤러
+# 4. 데이터 로더 & 종목 매핑 및 자동 섹터 분류 엔진
 # -------------------------------------------------------------
 @st.cache_data(ttl=86400)
 def load_all_krx_master():
@@ -198,8 +324,8 @@ def load_all_krx_master():
         if res.status_code == 200:
             dfs = pd.read_html(io.BytesIO(res.content), encoding="cp949")
             if dfs and not dfs[0].empty:
-                df = dfs[0][['회사명', '종목코드']].copy()
-                df.columns = ['Name', 'Code']
+                df = dfs[0][['회사명', '종목코드', '업종']].copy() if '업종' in dfs[0].columns else dfs[0][['회사명', '종목코드']].copy()
+                df.columns = ['Name', 'Code', 'Sector_Raw'] if '업종' in dfs[0].columns else ['Name', 'Code']
                 df['Code'] = df['Code'].astype(str).str.zfill(6)
                 return df.drop_duplicates(subset=['Code']).reset_index(drop=True)
     except Exception as e:
@@ -209,7 +335,7 @@ def load_all_krx_master():
 @st.cache_data(ttl=3600)
 def load_krx_listing():
     try:
-        df = fdr.StockListing('KRX')
+        df = load_stock_listing('KRX')
         if df is not None and not df.empty and 'Code' in df.columns:
             df['Code'] = df['Code'].astype(str).str.zfill(6)
             for num_col in ['Close', 'Volume', 'Amount', 'Marcap']:
@@ -242,6 +368,27 @@ def find_stock_code(query, df_krx):
         if not matched.empty: return matched.iloc[0]['Code'], matched.iloc[0]['Name']
     return None, None
 
+def get_sector_for_stock(code, df_krx=None):
+    """
+    [신규] KRX 표준 업종명을 분석하여 5대 대표 ETF 섹터로 키워드 기반 추정 매핑
+    """
+    master = load_all_krx_master()
+    raw_sec = ""
+    if not master.empty and 'Sector_Raw' in master.columns:
+        m = master[master['Code'] == code]
+        if not m.empty:
+            raw_sec = str(m.iloc[0]['Sector_Raw'])
+
+    if not raw_sec and df_krx is not None and not df_krx.empty and 'Sector' in df_krx.columns:
+        m2 = df_krx[df_krx['Code'] == code]
+        if not m2.empty:
+            raw_sec = str(m2.iloc[0]['Sector'])
+
+    for keyword, mapped_sec in KRX_INDUSTRY_KEYWORD_MAP.items():
+        if keyword in raw_sec:
+            return mapped_sec
+    return "대표지수"
+
 def get_supply_data(code):
     headers = {"User-Agent": "Mozilla/5.0"}
     res_data = {"frgn_5": 0, "inst_5": 0, "status": "FAIL"}
@@ -268,10 +415,6 @@ def get_supply_data(code):
 
 @st.cache_data(ttl=86400)
 def load_historical_foreign_series(code, pages=18):
-    """
-    네이버 금융 일별 외국인 순매수 시계열 수신 (~360거래일, 약 1.5년치)
-    백테스트 시점의 과거 5일 외국인 순매수 합계를 100% 동일하게 복원
-    """
     headers = {"User-Agent": "Mozilla/5.0"}
     records = []
     for p in range(1, pages + 1):
@@ -296,14 +439,72 @@ def load_historical_foreign_series(code, pages=18):
     if not records: return pd.Series(dtype=float)
     total_df = pd.concat(records).drop_duplicates(subset=['Date']).sort_values('Date').set_index('Date')
     total_df.index = pd.to_datetime(total_df.index).normalize()
-    # 과거 5거래일 순매수 합계
-    frgn_5d_sum = total_df['Net_Frgn'].rolling(5).sum()
-    return frgn_5d_sum
+    return total_df['Net_Frgn'].rolling(5).sum()
+
+@st.cache_data(ttl=86400)
+def load_sector_etf_series(sector_name, start_date="2022-01-01"):
+    etf_code = SECTOR_ETF_MAP.get(sector_name, "069500")
+    try:
+        df = load_price_history(etf_code, start_date)
+        if df is not None and not df.empty:
+            df.index = pd.to_datetime(df.index).normalize()
+            return df[['Close']]
+    except Exception:
+        pass
+    return pd.DataFrame()
 
 # -------------------------------------------------------------
-# 5. [100점 Entry Score] 20거래일 인덱스 보정 엔진
+# 5. [3단 계층 Sector RS 및 100점 Entry Score 엔진]
 # -------------------------------------------------------------
-def calculate_100p_score(df_slice, kospi_slice=None, has_frgn=False):
+def calculate_3tier_rs(df_slice, kospi_slice, sector_slice=None):
+    if kospi_slice is not None and not kospi_slice.empty:
+        shared = df_slice.index.intersection(kospi_slice.index)
+        if sector_slice is not None and not sector_slice.empty:
+            shared_sector = shared.intersection(sector_slice.index)
+            if len(shared_sector) >= 21:
+                shared = shared_sector
+                sector_slice = sector_slice.loc[shared]
+            else:
+                sector_slice = None
+        if len(shared) < 21:
+            return 5, "공통 거래일 부족 (기본 5점)"
+        df_slice = df_slice.loc[shared]
+        kospi_slice = kospi_slice.loc[shared]
+    curr_p = float(df_slice['Close'].iloc[-1])
+    if len(df_slice) < 21: return 5, "데이터 부족 (기본 5점)"
+
+    p_prev20 = float(df_slice['Close'].iloc[-21])
+    stk_ret20 = ((curr_p - p_prev20) / p_prev20) * 100
+
+    if kospi_slice is None or len(kospi_slice) < 21:
+        return (12 if stk_ret20 > 5.0 else 5), f"지수 부재 (단독등락: {stk_ret20:+.1f}%)"
+
+    k_curr = float(kospi_slice['Close'].iloc[-1])
+    k_prev20 = float(kospi_slice['Close'].iloc[-21])
+    mkt_ret20 = ((k_curr - k_prev20) / k_prev20) * 100
+    rs_market = stk_ret20 - mkt_ret20
+
+    if sector_slice is not None and len(sector_slice) >= 21:
+        s_curr = float(sector_slice['Close'].iloc[-1])
+        s_prev20 = float(sector_slice['Close'].iloc[-21])
+        sec_ret20 = ((s_curr - s_prev20) / s_prev20) * 100
+        rs_sector = sec_ret20 - mkt_ret20
+
+        if rs_market >= 5.0 and rs_sector >= 2.0:
+            return 15, f"주도섹터 주도주 (+{rs_market:.1f}% vs 섹터+{rs_sector:.1f}%)"
+        elif rs_market >= 0.0 and rs_sector >= 0.0:
+            return 10, f"동반 상승 (+{rs_market:.1f}% vs 섹터+{rs_sector:.1f}%)"
+        elif rs_market >= 0.0 and rs_sector < 0.0:
+            return 6, f"소외섹터 단독반등 (+{rs_market:.1f}% vs 섹터{rs_sector:.1f}%)"
+        else:
+            return 0, f"시장 언더퍼폼 ({rs_market:.1f}%)"
+
+    if rs_market >= 5.0: return 15, f"시장 주도주 (+{rs_market:.1f}%)"
+    elif rs_market >= 0.0: return 10, f"시장 부합 (+{rs_market:.1f}%)"
+    elif rs_market >= -5.0: return 5, f"소폭 언더퍼폼 ({rs_market:.1f}%)"
+    return 0, f"시장 대규모 언더퍼폼 ({rs_market:.1f}%)"
+
+def calculate_100p_score(df_slice, kospi_slice=None, sector_slice=None, has_frgn=False):
     if len(df_slice) < 25:
         return {"score": 0, "grade": "AVOID", "details": {}, "track": "WAIT"}
 
@@ -312,10 +513,10 @@ def calculate_100p_score(df_slice, kospi_slice=None, has_frgn=False):
     high_p = float(df_slice['High'].iloc[-1])
     low_p = float(df_slice['Low'].iloc[-1])
 
-    ma5 = float(df_slice['Close'].rolling(5).mean().iloc[-1])
-    ma20 = float(df_slice['Close'].rolling(20).mean().iloc[-1])
-    ma20_5d = float(df_slice['Close'].rolling(20).mean().iloc[-6])
-    ma60 = float(df_slice['Close'].rolling(60).mean().iloc[-1]) if len(df_slice) >= 60 else ma20
+    ma5 = float(df_slice["_engine_ma5"].iloc[-1]) if "_engine_ma5" in df_slice.columns else float(df_slice['Close'].iloc[-5:].mean())
+    ma20 = float(df_slice["_engine_ma20"].iloc[-1]) if "_engine_ma20" in df_slice.columns else float(df_slice['Close'].iloc[-20:].mean())
+    ma20_5d = float(df_slice["_engine_ma20_prev5"].iloc[-1]) if "_engine_ma20_prev5" in df_slice.columns else float(df_slice['Close'].iloc[-25:-5].mean())
+    ma60 = (float(df_slice["_engine_ma60"].iloc[-1]) if "_engine_ma60" in df_slice.columns else float(df_slice['Close'].iloc[-60:].mean())) if len(df_slice) >= 60 else ma20
 
     ma20_slope_pct = ((ma20 - ma20_5d) / ma20_5d) * 100 if ma20_5d > 0 else 0.0
     disparity_pct = ((curr_p - ma20) / ma20) * 100
@@ -360,24 +561,10 @@ def calculate_100p_score(df_slice, kospi_slice=None, has_frgn=False):
     score += vol_pts
     details["거래량"] = f"{vol_pts}/15"
 
-    # 5. 상대강도 RS (15점) - 정확한 20거래일 전(iloc[-21]) 대비
-    rs_pts = 5
-    if len(df_slice) >= 21:
-        p_prev20 = float(df_slice['Close'].iloc[-21])
-        stk_ret20 = ((curr_p - p_prev20) / p_prev20) * 100
-        if kospi_slice is not None and len(kospi_slice) >= 21:
-            k_curr = float(kospi_slice['Close'].iloc[-1])
-            k_prev20 = float(kospi_slice['Close'].iloc[-21])
-            mkt_ret20 = ((k_curr - k_prev20) / k_prev20) * 100
-            diff_rs = stk_ret20 - mkt_ret20
-            if diff_rs >= 5.0: rs_pts = 15
-            elif diff_rs >= 0.0: rs_pts = 10
-            elif diff_rs >= -5.0: rs_pts = 5
-            else: rs_pts = 0
-        else:
-            if stk_ret20 > 5.0: rs_pts = 12
+    # 5. 3단 계층 상대강도 RS (15점 만점 실질 연결)
+    rs_pts, rs_desc = calculate_3tier_rs(df_slice, kospi_slice, sector_slice)
     score += rs_pts
-    details["상대강도"] = f"{rs_pts}/15"
+    details["상대강도(RS)"] = f"{rs_pts}/15 ({rs_desc})"
 
     # 6. 전고점 근접 / 수급 참여 (15점)
     brk_pts = 0
@@ -415,23 +602,25 @@ def calculate_100p_score(df_slice, kospi_slice=None, has_frgn=False):
     }
 
 # -------------------------------------------------------------
-# 6. 가격선 설계 & 과도 손절폭 필터
+# 6. 가격선 설계 & 과도 손절폭 필터 (정합적 산출식 적용)
 # -------------------------------------------------------------
 def calculate_execution_levels(df_slice, entry_price):
     atr14 = calculate_wilder_atr(df_slice, 14)
     curr_p = float(entry_price)
-    ma20 = float(df_slice['Close'].rolling(20).mean().iloc[-1])
+    ma20 = float(df_slice["_engine_ma20"].iloc[-1]) if "_engine_ma20" in df_slice.columns else float(df_slice['Close'].iloc[-20:].mean())
     recent_swing_low = float(df_slice['Low'].iloc[-10:-1].min())
     high_20 = float(df_slice['High'].iloc[-21:-1].max())
 
+    # 첫 번째 무너지는 가장 가까운 지지선 후보 탐색
     stop_atr = curr_p - (1.5 * atr14)
     stop_struct = recent_swing_low - (0.2 * atr14)
     stop_trend = ma20 * 0.97
-    candidate_stop = min(stop_atr, stop_struct, stop_trend)
+    candidate_stop = max(stop_atr, stop_struct, stop_trend)
 
-    min_dist_price = curr_p - (1.2 * atr14)
-    final_stop_val = min(candidate_stop, min_dist_price)
-    
+    # 최소 1.2 ATR 안전거리 버퍼 확보
+    min_noise_boundary = curr_p - (1.2 * atr14)
+    final_stop_val = min(candidate_stop, min_noise_boundary)
+
     stop_price = floor_to_tick(final_stop_val)
     if stop_price >= curr_p:
         stop_price = floor_to_tick(curr_p * 0.96)
@@ -465,8 +654,8 @@ def calculate_execution_levels(df_slice, entry_price):
         "atr14": int(atr14)
     }
 
-def evaluate_full_execution_pipeline(df_slice, regime_code, kospi_slice=None, has_frgn=False, min_score=70):
-    scored = calculate_100p_score(df_slice, kospi_slice, has_frgn=has_frgn)
+def evaluate_full_execution_pipeline(df_slice, regime_code, kospi_slice=None, sector_slice=None, has_frgn=False, min_score=70):
+    scored = calculate_100p_score(df_slice, kospi_slice, sector_slice=sector_slice, has_frgn=has_frgn)
     curr_p = int(df_slice['Close'].iloc[-1])
     levels = calculate_execution_levels(df_slice, curr_p)
 
@@ -495,9 +684,9 @@ def calculate_position_sizing(account_capital, risk_pct, exec_multiplier, curr_p
     max_weight_shares = int((account_capital * 0.30) // curr_price)
 
     final_shares = max(0, min(raw_shares, max_liq_shares, max_weight_shares))
-    
+
     if final_shares == raw_shares:
-        limiting_factor = "RISK_BUDGET (1% 손실한도)"
+        limiting_factor = "RISK_BUDGET (설정 손실한도)"
     elif final_shares == max_weight_shares:
         limiting_factor = "WEIGHT_CAP (30% 계좌한도)"
     else:
@@ -518,7 +707,7 @@ def calculate_position_sizing(account_capital, risk_pct, exec_multiplier, curr_p
     }
 
 # -------------------------------------------------------------
-# 7. [공통 코어] 3-Track 체결 및 전면 슬리피지/체결모드 일중 관리 엔진
+# 7. [공통 코어] 3-Track 체결 및 일중 포지션 관리 엔진
 # -------------------------------------------------------------
 def check_3track_execution(track, b_open, b_high, b_low, ma20_entry, high_20, slippage_rate=0.0010):
     if b_open <= 0: return False, 0.0
@@ -543,8 +732,8 @@ def check_3track_execution(track, b_open, b_high, b_low, ma20_entry, high_20, sl
             return True, ceil_to_tick(exec_p)
     return False, 0.0
 
-def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_holding=10, sell_fee=0.0020, 
-                              market_slippage=0.0010, limit_slippage=0.0005, execution_mode="CONSERVATIVE"):
+def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_holding=10, sell_fee=0.0020,
+                              market_slippage=0.0010, limit_slippage=0.0005, execution_mode="CONSERVATIVE", trail_atr_mult=1.5):
     b_open = float(bar['Open'])
     b_high = float(bar['High'])
     b_low = float(bar['Low'])
@@ -557,6 +746,8 @@ def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_hol
     cur_shares = pos["shares"]
     pos["peak_price"] = max(pos["peak_price"], b_high)
 
+    if execution_mode not in {"CONSERVATIVE", "NEUTRAL", "OPTIMISTIC"}:
+        raise ValueError("Unsupported execution mode")
     exit_event = None
     exit_price = 0.0
     cash_gain_today = 0.0
@@ -571,12 +762,12 @@ def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_hol
             prioritize_stop = True
         elif execution_mode == "OPTIMISTIC":
             prioritize_stop = False
-        else:  # NEUTRAL: 음봉이면 손절 우선, 양봉이면 익절 우선
+        else:
             prioritize_stop = (b_close < b_open)
     else:
         prioritize_stop = hit_stop_candidate
 
-    # 1. 오버나이트 갭다운 손절 (시장가 슬리피지 차감)
+    # 1. 오버나이트 갭다운 손절
     if h_days > 1 and b_open <= c_stop:
         exit_event = "GAP_DOWN_STOP" if not pos["t1_hit"] else "GAP_DOWN_TRAILING"
         exit_price = floor_to_tick(b_open * (1.0 - market_slippage))
@@ -584,12 +775,12 @@ def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_hol
     elif prioritize_stop and hit_stop_candidate:
         exit_event = "STOP_LOSS" if not pos["t1_hit"] else "TRAILING_STOP"
         exit_price = floor_to_tick(c_stop * (1.0 - market_slippage))
-    # 3. Trend Break (시장가 슬리피지 차감)
+    # 3. Trend Break
     elif pos["t1_hit"] and (b_close < ma5_val) and (b_close < prev_low):
         exit_event = "TREND_BREAK_EXIT"
         exit_price = floor_to_tick(b_close * (1.0 - market_slippage))
     else:
-        # 4. T1 도달 (30% - 지정가 슬리피지 차감)
+        # 4. T1 도달 (30%)
         if not pos["t1_hit"] and b_high >= pos["t1"]:
             pos["t1_hit"] = True
             s_qty = min(int(pos["orig_shares"] * 0.30), cur_shares)
@@ -601,18 +792,21 @@ def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_hol
             cur_shares = pos["shares"]
             pos["current_stop"] = max(pos["current_stop"], e_price)
 
-            # 당일 본전 급락 재검사
             if b_low <= e_price and cur_shares > 0:
+                is_ambiguous = True
+            if (b_low <= e_price and cur_shares > 0
+                    and (execution_mode == "CONSERVATIVE"
+                         or (execution_mode == "NEUTRAL" and b_close < b_open))):
                 exit_event = "T1_THEN_BREAKEVEN"
                 exit_price = floor_to_tick(e_price * (1.0 - market_slippage))
 
-        # 5. 1.5R 보호 스탑 (+0.5R)
+        # 5. 1.5R 도달 시 +0.5R 보호 스탑 상향
         if exit_event is None and pos["t1_hit"] and not pos["t2_hit"]:
             r1 = pos["t1"] - e_price
             if b_high >= e_price + (1.5 * r1):
                 pos["current_stop"] = max(pos["current_stop"], floor_to_tick(e_price + 0.5 * r1))
 
-        # 6. T2 도달 (40% - 지정가 슬리피지 차감) & +1.0R 보호 스탑
+        # 6. T2 도달 (40%) & +1.0R 보호 스탑 상향
         if exit_event is None and not pos["t2_hit"] and b_high >= pos["t2"]:
             pos["t2_hit"] = True
             s_qty = min(int(pos["orig_shares"] * 0.40), pos["shares"])
@@ -625,21 +819,22 @@ def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_hol
             r1 = pos["t1"] - e_price
             pos["current_stop"] = max(pos["current_stop"], floor_to_tick(e_price + 1.0 * r1))
 
-        # 7. T2 달성 후 고점 대비 1.5 ATR 다이내믹 트레일링
+        # 7. T2 달성 후 고점 대비 trail_atr_mult ATR 다이내믹 트레일링
         if exit_event is None and pos["t2_hit"]:
-            dynamic_trail = floor_to_tick(pos["peak_price"] - (1.5 * pos["atr"]))
+            dynamic_trail = floor_to_tick(pos["peak_price"] - (trail_atr_mult * pos["atr"]))
             pos["current_stop"] = max(pos["current_stop"], dynamic_trail)
 
-        # 8. T3 도달 (잔여 전량 - 지정가 슬리피지 차감)
+        # 8. T3 도달 (잔여 전량)
         if exit_event is None and b_high >= pos["t3"]:
             pos["t3_hit"] = True
             exit_event = "TARGET_3R_FULL"
             exit_price = floor_to_tick(pos["t3"] * (1.0 - limit_slippage))
-        # 9. Time Stop (시장가 슬리피지 차감)
+        # 9. Time Stop
         elif exit_event is None and h_days >= max_holding:
             exit_event = "TIME_STOP"
             exit_price = floor_to_tick(b_close * (1.0 - market_slippage))
 
+    pos["ambiguous_seen"] = pos.get("ambiguous_seen", False) or is_ambiguous
     if exit_event is not None:
         rem_shares = pos["shares"]
         final_gain = rem_shares * exit_price * (1.0 - sell_fee)
@@ -663,35 +858,51 @@ def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_hol
             "T1_달성": pos["t1_hit"],
             "T2_달성": pos["t2_hit"],
             "T3_달성": pos["t3_hit"],
-            "모호봉_발생": is_ambiguous
+            "모호봉_발생": pos["ambiguous_seen"]
         }
         return None, cash_gain_today, trade_record
 
     return pos, cash_gain_today, None
 
 # -------------------------------------------------------------
-# 8. [단일 종목] 일별 MTM 실계좌 백테스터
+# 8. [단일 종목] 일별 MTM 실계좌 백테스터 (eval_start_date 워밍업 완결)
 # -------------------------------------------------------------
-def run_daily_mtm_backtest(df_hist, df_dual_regime, historical_supply_series=None, max_holding=10, initial_capital=30000000, risk_pct=1.0, 
-                           buy_cost=0.05, sell_cost=0.20, market_slippage=0.0010, limit_slippage=0.0005, execution_mode="CONSERVATIVE", min_score=70):
-    if len(df_hist) < 120 or df_dual_regime.empty: return pd.DataFrame(), pd.DataFrame(), {}
-    
+def run_daily_mtm_backtest(df_hist, df_dual_regime, historical_supply_series=None, sector_slice=None, max_holding=10, initial_capital=30000000, risk_pct=1.0,
+                           buy_cost=0.05, sell_cost=0.20, market_slippage=0.0010, limit_slippage=0.0005, execution_mode="CONSERVATIVE", min_score=70, trail_atr_mult=1.5, eval_start_date=None):
+    """
+    [수정] eval_start_date가 지정되면 직전 60일 데이터로 지표를 워밍업하고 지정일 첫날부터 OOS 거래를 개시
+    """
+    if len(df_hist) < 61 or df_dual_regime.empty: return pd.DataFrame(), pd.DataFrame(), {}
+
     df_p = df_hist.copy()
     df_p.index = pd.to_datetime(df_p.index).normalize()
+    df_p = df_p.loc[~df_p.index.duplicated(keep="last")].sort_index()
+    df_p = prepare_engine_history(df_p)
     df_reg = df_dual_regime.copy()
     df_reg.index = pd.to_datetime(df_reg.index).normalize()
-    
+    df_reg = df_reg.loc[~df_reg.index.duplicated(keep="last")].sort_index()
+
     buy_fee = buy_cost / 100.0
     sell_fee = sell_cost / 100.0
 
     cash = float(initial_capital)
     active_pos = None
     pending_entry = None
-    
+
     daily_records = []
     closed_trades = []
 
-    for idx in range(60, len(df_p)):
+    # 워밍업 인덱스 결정
+    if eval_start_date is not None:
+        eval_dt = pd.Timestamp(eval_start_date).normalize()
+        start_idx = max(60, df_p.index.searchsorted(eval_dt))
+    else:
+        start_idx = 60
+
+    if start_idx >= len(df_p):
+        return pd.DataFrame(), pd.DataFrame(), {}
+    # Seed the first evaluation-day order using the preceding close only.
+    for idx in range(start_idx - 1, len(df_p)):
         cur_date = df_p.index[idx]
         cur_date_str = cur_date.strftime("%Y-%m-%d")
         bar = df_p.iloc[idx]
@@ -709,7 +920,7 @@ def run_daily_mtm_backtest(df_hist, df_dual_regime, historical_supply_series=Non
                 if not plan["is_excessive_stop"]:
                     clean_amt = get_clean_avg_amount(df_p.iloc[:idx], 20)
                     pos = calculate_position_sizing(cash, risk_pct, pending_entry["multiplier"], e_price, plan["risk_1r"], plan["atr14"], clean_amt)
-                    shares = pos["shares"]
+                    shares = min(pos["shares"], int(cash // (e_price * (1.0 + buy_fee))))
                     if shares > 0:
                         req_cash = shares * e_price * (1.0 + buy_fee)
                         if cash >= req_cash:
@@ -741,25 +952,28 @@ def run_daily_mtm_backtest(df_hist, df_dual_regime, historical_supply_series=Non
             prev_low = float(df_p['Low'].iloc[idx-1])
             active_pos, cash_gain, trade_rec = process_intraday_position(
                 active_pos, bar, ma5_val, prev_low, cur_date_str, max_holding=max_holding, sell_fee=sell_fee,
-                market_slippage=market_slippage, limit_slippage=limit_slippage, execution_mode=execution_mode
+                market_slippage=market_slippage, limit_slippage=limit_slippage, execution_mode=execution_mode,
+                trail_atr_mult=trail_atr_mult
             )
             cash += cash_gain
             if trade_rec is not None:
                 closed_trades.append(trade_rec)
 
-        # C. 일별 종가 MTM 시가평가 (Close-to-Close)
+        # C. 일별 종가 MTM 시가평가
         holding_val = (active_pos["shares"] * b_close) if active_pos is not None else 0.0
         tot_equity = cash + holding_val
-        daily_records.append({
-            "Date": cur_date, "Cash": cash, "Stock_Value": holding_val,
-            "Total_Equity": tot_equity, "In_Position": (active_pos is not None)
-        })
+        if idx >= start_idx:
+            daily_records.append({
+                "Date": cur_date, "Cash": cash, "Stock_Value": holding_val,
+                "Total_Equity": tot_equity, "In_Position": (active_pos is not None)
+            })
 
-        # D. 장 마감 후 익일 시그널 평가 (과거 수급 시계열 자동 반영)
+        # D. 장 마감 후 익일 시그널 평가
         if active_pos is None and pending_entry is None:
             past_reg = df_reg.loc[df_reg.index <= cur_date]
             reg_code = past_reg.iloc[-1]['Regime'] if not past_reg.empty else "NEUTRAL"
             ks_sub = df_reg[['KS_Close']].rename(columns={'KS_Close': 'Close'}).loc[:cur_date]
+            sec_sub = sector_slice.loc[:cur_date] if sector_slice is not None else None
 
             has_frgn = False
             if historical_supply_series is not None and not historical_supply_series.empty:
@@ -767,9 +981,9 @@ def run_daily_mtm_backtest(df_hist, df_dual_regime, historical_supply_series=Non
                     has_frgn = bool(historical_supply_series.loc[cur_date] > 0)
                 else:
                     past_s = historical_supply_series.loc[historical_supply_series.index <= cur_date]
-                    if not past_s.empty: has_frgn = bool(past_s.iloc[-1] > 0)
+                    if not past_s.empty and (cur_date - past_s.index[-1]).days <= 7: has_frgn = bool(past_s.iloc[-1] > 0)
 
-            dec = evaluate_full_execution_pipeline(df_p.iloc[:idx+1], reg_code, kospi_slice=ks_sub, has_frgn=has_frgn, min_score=min_score)
+            dec = evaluate_full_execution_pipeline(df_p.iloc[:idx+1], reg_code, kospi_slice=ks_sub, sector_slice=sec_sub, has_frgn=has_frgn, min_score=min_score)
             if "BUY" in dec["action"]:
                 pending_entry = {
                     "regime": reg_code,
@@ -779,12 +993,14 @@ def run_daily_mtm_backtest(df_hist, df_dual_regime, historical_supply_series=Non
                     "ma20_entry": dec["scored"]["ma20"]
                 }
 
+    if not daily_records:
+        return pd.DataFrame(), pd.DataFrame(closed_trades), {}
     daily_df = pd.DataFrame(daily_records).set_index("Date")
     trades_df = pd.DataFrame(closed_trades)
 
     if daily_df.empty: return daily_df, trades_df, {}
 
-    daily_df['Peak'] = daily_df['Total_Equity'].cummax()
+    daily_df['Peak'] = daily_df['Total_Equity'].cummax().clip(lower=initial_capital)
     daily_df['Drawdown_pct'] = ((daily_df['Total_Equity'] - daily_df['Peak']) / daily_df['Peak']) * 100.0
     daily_mdd = round(abs(daily_df['Drawdown_pct'].min()), 2)
     tot_ret_pct = round(((daily_df['Total_Equity'].iloc[-1] - initial_capital) / initial_capital) * 100.0, 2)
@@ -820,9 +1036,11 @@ def run_daily_mtm_backtest(df_hist, df_dual_regime, historical_supply_series=Non
 # 9. [포트폴리오 바스켓] 다종목 동시 자본 배분 시뮬레이터
 # -------------------------------------------------------------
 def run_portfolio_backtest(ticker_list, df_dual_regime, df_krx=None, max_positions=3, max_holding=10, initial_capital=50000000, risk_pct=1.0,
-                           buy_cost=0.05, sell_cost=0.20, market_slippage=0.0010, limit_slippage=0.0005, execution_mode="CONSERVATIVE", min_score=70):
+                           buy_cost=0.05, sell_cost=0.20, market_slippage=0.0010, limit_slippage=0.0005, execution_mode="CONSERVATIVE", min_score=70, trail_atr_mult=1.5):
     s_date = (datetime.date.today() - datetime.timedelta(days=730)).strftime("%Y-%m-%d")
     data_dict = {}
+    frgn_dict = {}
+    sec_dict = {}
 
     for item in ticker_list:
         clean_item = str(item).strip()
@@ -835,10 +1053,14 @@ def run_portfolio_backtest(ticker_list, df_dual_regime, df_krx=None, max_positio
         if not code: continue
 
         try:
-            h = fdr.DataReader(code, s_date)
+            h = load_price_history(code, s_date)
             if h is not None and len(h) >= 120:
                 h.index = pd.to_datetime(h.index).normalize()
-                data_dict[code] = h
+                data_dict[code] = prepare_engine_history(h)
+                frgn_dict[code] = load_historical_foreign_series(code)
+                # 전 종목 섹터 ETF 자동 매핑 및 시계열 수신
+                sec_name = get_sector_for_stock(code, df_krx)
+                sec_dict[code] = load_sector_etf_series(sec_name, s_date)
         except Exception:
             continue
 
@@ -883,7 +1105,7 @@ def run_portfolio_backtest(ticker_list, df_dual_regime, df_krx=None, max_positio
 
                 stk_val_at_open = sum(p["shares"] * float(data_dict[c].loc[cur_date, 'Open']) for c, p in positions.items())
                 equity_at_open = cash + stk_val_at_open
-                
+
                 clean_amt = get_clean_avg_amount(df_code.iloc[:-1], 20)
                 pos_calc = calculate_position_sizing(
                     equity_at_open, risk_pct, item["multiplier"], e_price, plan["risk_1r"], plan["atr14"], clean_amt
@@ -928,7 +1150,8 @@ def run_portfolio_backtest(ticker_list, df_dual_regime, df_krx=None, max_positio
 
             updated_p, cash_gain, trade_rec = process_intraday_position(
                 p, bar, ma5_val, prev_low, cur_date_str, max_holding=max_holding, sell_fee=sell_fee,
-                market_slippage=market_slippage, limit_slippage=limit_slippage, execution_mode=execution_mode
+                market_slippage=market_slippage, limit_slippage=limit_slippage, execution_mode=execution_mode,
+                trail_atr_mult=trail_atr_mult
             )
             cash += cash_gain
             if trade_rec is not None:
@@ -939,14 +1162,14 @@ def run_portfolio_backtest(ticker_list, df_dual_regime, df_krx=None, max_positio
 
         for c in closed_codes: del positions[c]
 
-        # 3. MTM 일별 시가평가 (Close-to-Close)
+        # 3. MTM 일별 시가평가
         stk_val = sum(p["shares"] * float(data_dict[c].loc[cur_date, 'Close']) for c, p in positions.items())
         daily_records.append({
             "Date": cur_date, "Cash": cash, "Stock_Value": stk_val,
             "Total_Equity": cash + stk_val, "Num_Positions": len(positions)
         })
 
-        # 4. 익일 진입 스캔
+        # 4. 익일 진입 스캔 (과거 외국인 수급 및 전 종목 섹터 RS 완전 연동)
         if len(positions) < max_positions:
             past_reg = df_dual_regime.loc[df_dual_regime.index <= cur_date]
             reg_code = past_reg.iloc[-1]['Regime'] if not past_reg.empty else "NEUTRAL"
@@ -955,7 +1178,17 @@ def run_portfolio_backtest(ticker_list, df_dual_regime, df_krx=None, max_positio
             for code in data_dict.keys():
                 if code not in positions:
                     df_sub = data_dict[code].loc[:cur_date]
-                    dec = evaluate_full_execution_pipeline(df_sub, reg_code, kospi_slice=ks_sub, has_frgn=False, min_score=min_score)
+
+                    has_frgn = False
+                    f_series = frgn_dict.get(code)
+                    if f_series is not None and not f_series.empty:
+                        past_f = f_series.loc[f_series.index <= cur_date]
+                        if not past_f.empty and (cur_date - past_f.index[-1]).days <= 7: has_frgn = bool(past_f.iloc[-1] > 0)
+
+                    sec_df = sec_dict.get(code)
+                    sec_sub = sec_df.loc[:cur_date] if (sec_df is not None and not sec_df.empty) else None
+
+                    dec = evaluate_full_execution_pipeline(df_sub, reg_code, kospi_slice=ks_sub, sector_slice=sec_sub, has_frgn=has_frgn, min_score=min_score)
                     if "BUY" in dec["action"]:
                         pending_signals.append({
                             "code": code,
@@ -966,11 +1199,13 @@ def run_portfolio_backtest(ticker_list, df_dual_regime, df_krx=None, max_positio
                             "ma20_entry": dec["scored"]["ma20"]
                         })
 
+    if not daily_records:
+        return pd.DataFrame(), pd.DataFrame(closed_trades), {}
     port_df = pd.DataFrame(daily_records).set_index("Date")
     p_trades = pd.DataFrame(closed_trades)
     if port_df.empty: return port_df, p_trades, {}
 
-    port_df['Peak'] = port_df['Total_Equity'].cummax()
+    port_df['Peak'] = port_df['Total_Equity'].cummax().clip(lower=initial_capital)
     port_df['Drawdown_pct'] = ((port_df['Total_Equity'] - port_df['Peak']) / port_df['Peak']) * 100.0
     p_mdd = round(abs(port_df['Drawdown_pct'].min()), 2)
     p_ret = round(((port_df['Total_Equity'].iloc[-1] - initial_capital) / initial_capital) * 100.0, 2)
@@ -999,14 +1234,13 @@ def run_portfolio_backtest(ticker_list, df_dual_regime, df_krx=None, max_positio
     return port_df, p_trades, metrics
 
 # -------------------------------------------------------------
-# 10. [Walk-Forward WFO & 3-모드 삼각비교 엔진]
+# 10. [진성 3D Walk-Forward Optimization & 3-모드 삼각비교 엔진]
 # -------------------------------------------------------------
-def run_tricorder_backtest(df_hist, df_dual_regime, historical_supply_series=None, initial_capital=30000000, risk_pct=1.0):
-    """Conservative, Neutral, Optimistic 3개 모드를 동시 연산하여 안전 마진과 불확실성 델타 산출"""
+def run_tricorder_backtest(df_hist, df_dual_regime, historical_supply_series=None, sector_slice=None, initial_capital=30000000, risk_pct=1.0):
     results = {}
     for mode in ["CONSERVATIVE", "NEUTRAL", "OPTIMISTIC"]:
         daily_df, trades_df, met = run_daily_mtm_backtest(
-            df_hist, df_dual_regime, historical_supply_series=historical_supply_series,
+            df_hist, df_dual_regime, historical_supply_series=historical_supply_series, sector_slice=sector_slice,
             initial_capital=initial_capital, risk_pct=risk_pct, execution_mode=mode
         )
         results[mode] = met
@@ -1023,7 +1257,7 @@ def run_tricorder_backtest(df_hist, df_dual_regime, historical_supply_series=Non
             "일별 MTM MDD": f"-{results['CONSERVATIVE']['daily_mdd']}%",
             "Profit Factor": results['CONSERVATIVE']['profit_factor'],
             "승률": f"{results['CONSERVATIVE']['win_rate']}%",
-            "모호봉 건수": f"{results['CONSERVATIVE']['ambiguous_count']}건"
+            "모호봉 발생 거래 수": f"{results['CONSERVATIVE']['ambiguous_count']}건"
         },
         {
             "체결 모드": "중립적 (Candle-Flow)",
@@ -1032,7 +1266,7 @@ def run_tricorder_backtest(df_hist, df_dual_regime, historical_supply_series=Non
             "일별 MTM MDD": f"-{results['NEUTRAL']['daily_mdd']}%",
             "Profit Factor": results['NEUTRAL']['profit_factor'],
             "승률": f"{results['NEUTRAL']['win_rate']}%",
-            "모호봉 건수": f"{results['NEUTRAL']['ambiguous_count']}건"
+            "모호봉 발생 거래 수": f"{results['NEUTRAL']['ambiguous_count']}건"
         },
         {
             "체결 모드": "낙관적 (Target-First)",
@@ -1041,17 +1275,17 @@ def run_tricorder_backtest(df_hist, df_dual_regime, historical_supply_series=Non
             "일별 MTM MDD": f"-{results['OPTIMISTIC']['daily_mdd']}%",
             "Profit Factor": results['OPTIMISTIC']['profit_factor'],
             "승률": f"{results['OPTIMISTIC']['win_rate']}%",
-            "모호봉 건수": f"{results['OPTIMISTIC']['ambiguous_count']}건"
+            "모호봉 발생 거래 수": f"{results['OPTIMISTIC']['ambiguous_count']}건"
         }
     ])
     return comp_df, results
 
-def run_slippage_stress_test(df_hist, df_dual_regime, historical_supply_series=None, initial_capital=30000000, risk_pct=1.0):
+def run_slippage_stress_test(df_hist, df_dual_regime, historical_supply_series=None, sector_slice=None, initial_capital=30000000, risk_pct=1.0):
     slippage_levels = [0.0005, 0.0010, 0.0020, 0.0030, 0.0050]
     stress_results = []
     for s_rate in slippage_levels:
         _, _, met = run_daily_mtm_backtest(
-            df_hist, df_dual_regime, historical_supply_series=historical_supply_series,
+            df_hist, df_dual_regime, historical_supply_series=historical_supply_series, sector_slice=sector_slice,
             initial_capital=initial_capital, risk_pct=risk_pct,
             market_slippage=s_rate, limit_slippage=s_rate/2.0
         )
@@ -1067,63 +1301,95 @@ def run_slippage_stress_test(df_hist, df_dual_regime, historical_supply_series=N
             })
     return pd.DataFrame(stress_results)
 
-def run_true_wfo(df_hist, df_dual_regime, historical_supply_series=None, windows=4, initial_capital=30000000):
+def run_multidimensional_wfo(df_hist, df_dual_regime, historical_supply_series=None, sector_slice=None, windows=4, initial_capital=30000000):
     """
-    진성 Walk-Forward Optimization (WFO):
-    IS에서 최적 스코어(65, 70, 75, 80점)를 탐색한 뒤, 파라미터를 OOS에 블라인드 동결 적용하여 WFE를 산출
+    [수정] WFO 워밍업 정합성 완전 해결:
+    IS/OOS 분할 시 직전 60거래일 워밍업 캔들을 사전 공급하고 eval_start_date부터 실제 매매를 평가
     """
     df_p = df_hist.copy()
+    df_p.index = pd.to_datetime(df_p.index).normalize()
+    df_p = df_p.loc[~df_p.index.duplicated(keep="last")].sort_index()
+    df_p = prepare_engine_history(df_p)
     total_len = len(df_p)
     if total_len < 250: return pd.DataFrame()
 
-    segment_len = total_len // (windows + 1)
+    if windows < 1:
+        raise ValueError("windows must be positive")
+    segment_len = (total_len - 60) // (windows + 2)
+    if segment_len < 20:
+        return pd.DataFrame()
     wf_records = []
-    score_candidates = [65, 70, 75, 80]
+
+    grid_scores = [70, 75, 80]
+    grid_trails = [1.2, 1.5, 2.0]
+    grid_holds = [7, 10, 14]
 
     for w in range(windows):
-        train_start = w * segment_len
+        train_start = 60 + w * segment_len
         train_end = train_start + (segment_len * 2)
-        test_end = min(train_end + segment_len, total_len)
+        test_end = total_len if w == windows - 1 else min(train_end + segment_len, total_len)
         if train_end >= total_len or train_end >= test_end: break
 
-        df_train = df_p.iloc[train_start:train_end]
-        df_test = df_p.iloc[train_end:test_end]
+        # 워밍업 버퍼 60거래일 선행 결합
+        is_warmup_start = max(0, train_start - 60)
+        df_train_with_warmup = df_p.iloc[is_warmup_start:train_end]
+        is_eval_start = df_p.index[train_start]
 
-        # 1. In-Sample(IS) 최적 파라미터 탐색
-        best_score = 70
-        best_is_pf = -1.0
-        best_is_ret = 0.0
+        oos_warmup_start = max(0, train_end - 60)
+        df_test_with_warmup = df_p.iloc[oos_warmup_start:test_end]
+        oos_eval_start = df_p.index[train_end]
 
-        for sc in score_candidates:
-            _, _, m_tr = run_daily_mtm_backtest(
-                df_train, df_dual_regime, historical_supply_series=historical_supply_series,
-                initial_capital=initial_capital, min_score=sc
-            )
-            if m_tr and m_tr["profit_factor"] > best_is_pf:
-                best_is_pf = m_tr["profit_factor"]
-                best_is_ret = m_tr["total_return_pct"]
-                best_score = sc
+        best_params = None
+        best_is_fitness = -999999.0
+        best_is_met = None
 
-        # 2. Out-of-Sample(OOS) 블라인드 동결 검증
-        _, _, m_te = run_daily_mtm_backtest(
-            df_test, df_dual_regime, historical_supply_series=historical_supply_series,
-            initial_capital=initial_capital, min_score=best_score
+        # 1. IS 27개 3D 조합 전수 탐색
+        for sc in grid_scores:
+            for tr_mult in grid_trails:
+                for hd in grid_holds:
+                    is_daily, _, m_tr = run_daily_mtm_backtest(
+                        df_train_with_warmup, df_dual_regime, historical_supply_series=historical_supply_series, sector_slice=sector_slice,
+                        initial_capital=initial_capital, min_score=sc, max_holding=hd, trail_atr_mult=tr_mult, eval_start_date=is_eval_start
+                    )
+                    if m_tr and m_tr["total_trades"] >= 3:
+                        fitness = m_tr["profit_factor"] * math.log(m_tr["total_trades"] + 1)
+                        if fitness > best_is_fitness:
+                            best_is_fitness = fitness
+                            best_params = (sc, tr_mult, hd)
+                            best_is_met = m_tr
+                            best_is_days = len(is_daily)
+
+        if not best_params:
+            best_params = (70, 1.5, 10)
+            is_daily, _, best_is_met = run_daily_mtm_backtest(df_train_with_warmup, df_dual_regime, historical_supply_series=historical_supply_series, sector_slice=sector_slice, initial_capital=initial_capital, eval_start_date=is_eval_start)
+
+            best_is_days = len(is_daily)
+
+        # 2. OOS 3개 최적 파라미터 완전 동결 검증 (워밍업 정상화)
+        opt_score, opt_trail, opt_hold = best_params
+        oos_daily, _, m_te = run_daily_mtm_backtest(
+            df_test_with_warmup, df_dual_regime, historical_supply_series=historical_supply_series, sector_slice=sector_slice,
+            initial_capital=initial_capital, min_score=opt_score, max_holding=opt_hold, trail_atr_mult=opt_trail, eval_start_date=oos_eval_start
         )
 
-        if m_te:
+        if m_te and best_is_met:
+            is_ret = best_is_met["total_return_pct"]
             oos_ret = m_te["total_return_pct"]
-            wfe = round((oos_ret / best_is_ret) * 100, 1) if best_is_ret > 0 else 0.0
+            is_daily_ret = (1 + is_ret / 100) ** (1 / max(best_is_days, 1)) - 1
+            oos_daily_ret = (1 + oos_ret / 100) ** (1 / max(len(oos_daily), 1)) - 1
+            wfe = round(oos_daily_ret / is_daily_ret * 100, 1) if is_daily_ret > 0 else None
 
             wf_records.append({
                 "구간": f"Window {w+1}",
-                "IS 구간": f"{df_train.index[0].strftime('%y.%m')} ~ {df_train.index[-1].strftime('%y.%m')}",
-                "최적 파라미터": f"Score {best_score}점",
-                "IS 수익률(%)": best_is_ret,
-                "IS PF": best_is_pf,
-                "OOS 블라인드 구간": f"{df_test.index[0].strftime('%y.%m')} ~ {df_test.index[-1].strftime('%y.%m')}",
+                "IS 구간": f"{is_eval_start.strftime('%y.%m')} ~ {df_p.index[train_end-1].strftime('%y.%m')}",
+                "IS 최적 3D 파라미터": f"Score {opt_score}점 / Trail {opt_trail}x / Hold {opt_hold}일",
+                "IS 수익률(%)": is_ret,
+                "IS PF": best_is_met["profit_factor"],
+                "OOS 블라인드 구간": f"{oos_eval_start.strftime('%y.%m')} ~ {df_p.index[test_end-1].strftime('%y.%m')}",
                 "OOS 수익률(%)": oos_ret,
                 "OOS PF": m_te["profit_factor"],
-                "WFE(%)": f"{wfe}%"
+                "WFE(%)": f"{wfe}%" if wfe is not None else "산출 불가 (IS 수익률 ≤ 0)",
+                "검증 기준 판정": "✅ 통과" if (wfe is not None and wfe >= 50.0 and m_te["profit_factor"] >= 1.1 and m_te["total_trades"] >= 3) else "⚠️ 경고"
             })
 
     return pd.DataFrame(wf_records)
@@ -1138,19 +1404,20 @@ st.caption("“주가를 예측하지 않고, **틀렸을 때 손실을 제한�
 
 c_rg1, c_rg2 = st.columns([1, 3])
 with c_rg1:
-    st.metric("실시간 듀얼 시장 국면", dual_regime["status"], f"배분 배수: {dual_regime['multiplier']}x")
+    st.metric("최근 데이터 기준 듀얼 시장 국면", dual_regime["status"], f"배분 배수: {dual_regime['multiplier']}x")
 with c_rg2:
     st.info(f"💡 **시장 대응 지침**: {dual_regime['msg']}")
 
 if "selected_stock" not in st.session_state:
     st.session_state["selected_stock"] = "삼성전자"
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 STEP 1 · 실행 중심 퀀트 진단 & 포지션 계산",
     "📡 STEP 2 · 코스피 Buy Zone 스크리너",
     "🧪 STEP 3 · 단일 종목 실계좌 MTM 백테스트",
     "💼 STEP 4 · 다종목 포트폴리오 시뮬레이터",
-    "🔬 STEP 5 · Walk-Forward(WFO) & 스트레스 테스트",
+    "🔬 STEP 5 · 3D Walk-Forward(WFO) & 스트레스 테스트",
+    "📘 주린이 눈높이 실전 매뉴얼",
     "📖 시스템 무결성 헌장"
 ])
 
@@ -1159,7 +1426,15 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 # -------------------------------------------------------------
 with tab1:
     st.subheader("정밀 실행 계획 & 리스크 기반 포지션 산출")
-    
+
+    with st.expander("💡 [주린이 30초 요약] 이 화면을 어떻게 읽고 행동해야 하나요? (클릭하여 열기)"):
+        st.markdown("""
+        * **1. 최종 판정 확인**: `🟢 BUY`가 떴을 때만 매수합니다. `🟡 WAIT`이나 `🔴 AVOID`면 미련 없이 창을 닫습니다.
+        * **2. 가격 4총사 메모**: HTS/MTS를 켜고 **동적 손절선**과 **1차 목표가(+1R)**를 먼저 입력합니다.
+        * **3. 딱 '권장 매수 수량'만큼만 주문**: 내 원금 전체를 몰빵하지 말고, 시스템이 1% 리스크 공식으로 정해준 주수만큼만 삽니다.
+        * **4. 체결 즉시 스탑로스 설정**: 주식을 사자마자 증권사 앱에서 **손절가에 '자동 감시 매도'**를 걸어둡니다.
+        """)
+
     col1, col2, col3 = st.columns([2, 1.5, 1])
     with col1:
         target_stock = st.text_input("종목명 또는 6자리 코드", value=st.session_state["selected_stock"])
@@ -1172,20 +1447,23 @@ with tab1:
         with st.spinner("호가 검증 및 100점 파이프라인 연산 중..."):
             df_krx = load_krx_listing()
             code, name = find_stock_code(target_stock, df_krx)
-            
+
             if not code:
                 st.error("종목을 찾을 수 없습니다.")
             else:
                 s_date = (datetime.date.today() - datetime.timedelta(days=350)).strftime("%Y-%m-%d")
-                df_p = fdr.DataReader(code, s_date)
-                df_ks = fdr.DataReader('KS11', s_date)
-                
+                df_p = load_price_history(code, s_date)
+                df_ks = load_price_history('KS11', s_date)
+
+                sec_name = get_sector_for_stock(code, df_krx)
+                sec_df = load_sector_etf_series(sec_name, s_date)
+
                 if df_p is None or len(df_p) < 40:
                     st.error("데이터가 불충분합니다.")
                 else:
                     supply = get_supply_data(code)
                     verdict = evaluate_full_execution_pipeline(
-                        df_p, dual_regime["code"], kospi_slice=df_ks, has_frgn=(supply["frgn_5"] > 0)
+                        df_p, dual_regime["code"], kospi_slice=df_ks, sector_slice=sec_df, has_frgn=(supply["frgn_5"] > 0)
                     )
                     levels = verdict["levels"]
                     scored = verdict["scored"]
@@ -1199,13 +1477,13 @@ with tab1:
 
                     st.markdown("---")
                     if "BUY" in verdict["action"]:
-                        st.success(f"### {verdict['badge']}\n**진입 전략 트랙**: `{scored['track']}` | **지침**: {verdict['reason']}")
+                        st.success(f"### {verdict['badge']}\n**진입 전략 트랙**: `{scored['track']}` | **업종 매핑**: `{sec_name}` | **지침**: {verdict['reason']}")
                     elif verdict["action"] == "WAIT":
-                        st.warning(f"### {verdict['badge']}\n**지침**: {verdict['reason']}")
+                        st.warning(f"### {verdict['badge']}\n**업종 매핑**: `{sec_name}` | **지침**: {verdict['reason']}")
                     else:
                         st.error(f"### {verdict['badge']}\n**지침**: {verdict['reason']}")
 
-                    st.markdown("#### 💯 100점 만점 퀀트 평가 내역")
+                    st.markdown("#### 💯 100점 만점 퀀트 평가 내역 (전 종목 Sector RS 자동 결합)")
                     dt_cols = st.columns(6)
                     for i, (k, v) in enumerate(scored["details"].items()):
                         dt_cols[i].metric(k, v)
@@ -1244,21 +1522,24 @@ with tab1:
                             st.info(f"**AI 리스크 브리핑**:\n\n{rep}")
 
 # -------------------------------------------------------------
-# TAB 2: 코스피 Buy Zone 스크리너 (PyArrow 문자열 타입 에러 방어)
+# TAB 2: 코스피 Buy Zone 스크리너 (수급 정합성 옵션 추가)
 # -------------------------------------------------------------
 with tab2:
     st.subheader("코스피 Buy Zone 지지 및 반등 트리거 탐색기")
-    st.caption("동일한 100점 파이프라인을 전 종목 풀에 실시간 적용하여 70점 이상 유효 종목만 선별합니다.")
+    st.caption("업종은 키워드 기반 추정입니다. IT/플랫폼은 코스닥150 대용 지표, 미분류는 대표지수 ETF를 사용합니다. 동일한 100점 파이프라인을 전 종목 풀에 적용하여 70점 이상 유효 종목만 선별합니다.")
 
-    c_s1, c_s2 = st.columns(2)
+    c_s1, c_s2, c_s3 = st.columns([1.5, 1.5, 1])
     with c_s1:
         min_cap = st.number_input("시가총액 하한 (억원)", 500, 20000, 2000, step=500)
     with c_s2:
-        scan_pool = st.slider("스캔 풀 (거래대금 상위)", 100, 300, 150, step=50)
+        scan_pool = st.slider("스캔 풀 (거래대금 상위)", 50, 300, 100, step=50)
+    with c_s3:
+        include_supply_in_scan = st.checkbox("외국인 수급 5점 결합 (정밀 스캔)", value=False, help="체크 시 종목별 최근 수급을 조회하여 STEP 1과 동일한 수급 가점을 적용합니다. 조회 시점·데이터 차이로 점수가 다를 수 있습니다 (약간의 로딩 시간 소요).")
 
     if st.button("Buy Zone 종목 스캔 시작", type="primary"):
-        with st.spinner("코스피 후보군 100점 평가 검증 중..."):
-            df_k = fdr.StockListing('KOSPI')
+        with st.spinner("코스피 후보군 100점 평가 및 섹터 RS 자동 검증 중..."):
+            df_k = load_stock_listing('KOSPI')
+            df_krx = load_krx_listing()
             if df_k is None or df_k.empty:
                 st.error("코스피 종목 로드 실패.")
             else:
@@ -1268,21 +1549,29 @@ with tab2:
                         df_k[num_col] = pd.to_numeric(df_k[num_col].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
                 if 'Amount' not in df_k.columns or (df_k['Amount'] == 0).all():
                     df_k['Amount'] = df_k['Close'] * df_k['Volume']
-                
+
                 pool = df_k[df_k['Marcap'] >= (min_cap * 100000000)].sort_values(by="Amount", ascending=False).head(scan_pool)
                 screened = []
                 p_bar = st.progress(0)
                 s_date = (datetime.date.today() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
-                df_ks = fdr.DataReader('KS11', s_date)
+                df_ks = load_price_history('KS11', s_date)
 
                 for idx, (_, r) in enumerate(pool.iterrows()):
                     p_bar.progress((idx + 1) / len(pool))
                     code, name = str(r['Code']).zfill(6), r['Name']
                     try:
-                        h = fdr.DataReader(code, s_date)
+                        h = load_price_history(code, s_date)
                         if h is None or len(h) < 30: continue
-                        
-                        dec = evaluate_full_execution_pipeline(h, dual_regime["code"], kospi_slice=df_ks, has_frgn=False)
+
+                        sec_name = get_sector_for_stock(code, df_krx)
+                        sec_df = load_sector_etf_series(sec_name, s_date)
+
+                        has_frgn = False
+                        if include_supply_in_scan:
+                            sup = get_supply_data(code)
+                            has_frgn = (sup["frgn_5"] is not None and sup["frgn_5"] > 0)
+
+                        dec = evaluate_full_execution_pipeline(h, dual_regime["code"], kospi_slice=df_ks, sector_slice=sec_df, has_frgn=has_frgn)
                         if "BUY" in dec["action"]:
                             c_p = int(h['Close'].iloc[-1])
                             lvs = dec["levels"]
@@ -1290,6 +1579,7 @@ with tab2:
                                 "코드": code, "종목명": name, "현재가": c_p,
                                 "스코어": f"{dec['scored']['score']}점",
                                 "트랙": dec['scored']['track'],
+                                "매핑섹터": sec_name,
                                 "최종판정": dec["badge"], "손절가": lvs["stop_price"],
                                 "손절폭(%)": lvs["loss_pct"], "1차목표(1R)": lvs["target_1r"],
                                 "2차목표(2R)": lvs["target_2r"], "거래대금(억)": int(r['Amount'] / 100000000)
@@ -1307,7 +1597,7 @@ with tab2:
     if "screened_res" in st.session_state and not st.session_state["screened_res"].empty:
         df_show = st.session_state["screened_res"]
         st.dataframe(df_show, width='stretch')
-        
+
         sel = st.selectbox("진단 탭으로 전송할 종목 선택", df_show["종목명"].tolist())
         if st.button("선택 종목을 STEP 1으로 전송"):
             st.session_state["selected_stock"] = sel
@@ -1318,7 +1608,7 @@ with tab2:
 # -------------------------------------------------------------
 with tab3:
     st.subheader("단일 종목 일별 시가평가(Daily MTM) 실계좌 백테스트")
-    st.caption("3-Track 실제 체결, 부분익절 누적 현금흐름 완결 회계, 과거 5일 외국인 수급 복원 및 일별 종가 MTM MDD를 반영합니다.")
+    st.caption("일봉 체결 후 고저 순서는 알 수 없어 체결 모드별 가정을 적용합니다. 3-Track 모의 체결, 부분익절 누적 현금흐름 완결 회계, 과거 5일 외국인 수급 및 전 종목 자동 Sector RS를 동시 반영합니다.")
 
     bt_stock = st.text_input("백테스트 대상 종목명 또는 코드", value=st.session_state["selected_stock"])
     c_b1, c_b2, c_b3, c_b4 = st.columns(4)
@@ -1338,20 +1628,22 @@ with tab3:
         start_tricorder_bt = st.button("⚡ 3-모드 동시 삼각비교(Tricorder) 가동")
 
     if start_single_bt or start_tricorder_bt:
-        with st.spinner(f"'{bt_stock}' 과거 2년 수급 시계열 크롤링 및 MTM 연산 중..."):
+        with st.spinner(f"'{bt_stock}' 과거 2년 수급·섹터 시계열 동기화 및 MTM 연산 중..."):
             df_krx = load_krx_listing()
             b_code, b_name = find_stock_code(bt_stock, df_krx)
             if not b_code:
                 st.error("종목을 찾을 수 없습니다.")
             else:
                 s_date = (datetime.date.today() - datetime.timedelta(days=730)).strftime("%Y-%m-%d")
-                df_bt = fdr.DataReader(b_code, s_date)
+                df_bt = load_price_history(b_code, s_date)
                 dual_hist = load_historical_dual_regime(s_date)
                 frgn_hist = load_historical_foreign_series(b_code)
+                sec_name = get_sector_for_stock(b_code, df_krx)
+                sec_df = load_sector_etf_series(sec_name, s_date)
 
                 if start_tricorder_bt:
                     comp_df, tri_res = run_tricorder_backtest(
-                        df_bt, dual_hist, historical_supply_series=frgn_hist,
+                        df_bt, dual_hist, historical_supply_series=frgn_hist, sector_slice=sec_df,
                         initial_capital=bt_init_cap, risk_pct=bt_risk_pct
                     )
                     st.markdown("### ⚡ 3-모드 체결 불확실성 삼각비교 (Tricorder Comparison)")
@@ -1363,7 +1655,7 @@ with tab3:
                     }))
                 else:
                     daily_df, trades_df, met = run_daily_mtm_backtest(
-                        df_bt, dual_hist, historical_supply_series=frgn_hist, max_holding=bt_hold,
+                        df_bt, dual_hist, historical_supply_series=frgn_hist, sector_slice=sec_df, max_holding=bt_hold,
                         initial_capital=bt_init_cap, risk_pct=bt_risk_pct,
                         execution_mode=exec_mode
                     )
@@ -1371,7 +1663,7 @@ with tab3:
                     if daily_df.empty:
                         st.warning("과거 2년간 모든 엄격한 필터를 통과한 거래가 없습니다.")
                     else:
-                        st.markdown(f"### 📊 '{b_name}'({b_code}) 일별 MTM 실계좌 성과 요약")
+                        st.markdown(f"### 📊 '{b_name}'({b_code}) 일별 MTM 실계좌 성과 요약 (섹터: {sec_name})")
                         k1, k2, k3, k4 = st.columns(4)
                         k1.metric("최종 계좌 잔고", f"{met['final_equity']:,}원", f"{met['total_return_pct']:+}%")
                         k2.metric("일별 종가 MTM MDD", f"-{met['daily_mdd']}%", "Close-to-Close", delta_color="inverse")
@@ -1389,15 +1681,15 @@ with tab3:
                         st.dataframe(trades_df, width='stretch')
 
 # -------------------------------------------------------------
-# TAB 4: 다종목 포트폴리오 시뮬레이터
+# TAB 4: 다종목 포트폴리오 시뮬레이터 (전 종목 수급·섹터·트레일 완전 일치)
 # -------------------------------------------------------------
 with tab4:
     st.subheader("다종목 동시 보유 포트폴리오 시뮬레이터 (Portfolio MTM)")
-    st.caption("전체 계좌 자산 기준 1% 리스크 사이징, 점수 순 슬롯 배정 및 3-Track과 동적 Trailing을 완전 일치 검증합니다.")
+    st.caption("외국인 수급은 조회 가능한 과거 구간에서만 반영합니다. 섹터는 현재 업종 기준 추정이며 과거 업종 변경은 반영하지 않습니다. 전체 계좌 자산 기준 리스크 사이징, 종목별 과거 수급 5일 합계 및 전 종목 자동 Sector RS·다이내믹 Trailing을 완전 일치 검증합니다.")
 
     default_tickers = "005930, 000660, 005380, 035420"
     basket_input = st.text_input("포트폴리오 바스켓 (종목명 또는 코드, 콤마 구분)", value=default_tickers)
-    
+
     cp1, cp2, cp3, cp4 = st.columns(4)
     with cp1:
         port_capital = st.number_input("포트폴리오 초기 총자산 (원)", value=50000000, step=10000000)
@@ -1414,7 +1706,7 @@ with tab4:
             df_krx = load_krx_listing()
             s_date = (datetime.date.today() - datetime.timedelta(days=730)).strftime("%Y-%m-%d")
             dual_hist = load_historical_dual_regime(s_date)
-            
+
             p_df, p_trades, p_met = run_portfolio_backtest(
                 tickers, dual_hist, df_krx=df_krx, max_positions=max_slots,
                 initial_capital=port_capital, risk_pct=port_risk, execution_mode=p_exec_mode
@@ -1435,14 +1727,14 @@ with tab4:
                 st.dataframe(p_trades, width='stretch')
 
 # -------------------------------------------------------------
-# TAB 5: Walk-Forward WFO & 슬리피지 스트레스 테스트
+# TAB 5: 진성 3D Walk-Forward WFO & 슬리피지 스트레스 테스트
 # -------------------------------------------------------------
 with tab5:
-    st.subheader("🔬 진성 Walk-Forward Optimization (WFO) & 슬리피지 부하 검증")
-    st.caption("IS에서 파라미터를 탐색한 뒤 OOS에 블라인드 동결 적용하는 WFO 효율(WFE)과 슬리피지 급증 시 임계점을 평가합니다.")
+    st.subheader("🔬 진성 3D Walk-Forward Optimization (WFO) & 슬리피지 부하 검증")
+    st.caption("IS에서 [Score x Trail x Hold] 27개 조합을 탐색하고 OOS에서 고정 평가합니다. 60거래일 워밍업과 일별 복리 수익률 기준 WFE를 사용합니다.")
 
     test_stock = st.text_input("검증 대상 종목명 또는 코드", value=st.session_state["selected_stock"], key="stress_stock")
-    
+
     col_t1, col_t2 = st.columns(2)
     with col_t1:
         if st.button("슬리피지 민감도 테스트 가동", type="primary"):
@@ -1451,48 +1743,130 @@ with tab5:
                 b_code, _ = find_stock_code(test_stock, df_krx)
                 if b_code:
                     s_date = (datetime.date.today() - datetime.timedelta(days=730)).strftime("%Y-%m-%d")
-                    df_bt = fdr.DataReader(b_code, s_date)
+                    df_bt = load_price_history(b_code, s_date)
                     dual_hist = load_historical_dual_regime(s_date)
                     frgn_hist = load_historical_foreign_series(b_code)
-                    stress_df = run_slippage_stress_test(df_bt, dual_hist, historical_supply_series=frgn_hist)
+                    sec_name = get_sector_for_stock(b_code, df_krx)
+                    sec_df = load_sector_etf_series(sec_name, s_date)
+
+                    stress_df = run_slippage_stress_test(df_bt, dual_hist, historical_supply_series=frgn_hist, sector_slice=sec_df)
                     st.markdown("#### 📊 슬리피지 단계별 성과 변동표")
                     st.dataframe(stress_df, width='stretch')
                 else:
                     st.error("종목을 찾을 수 없습니다.")
 
     with col_t2:
-        if st.button("진성 Walk-Forward(WFO) 분석 가동", type="primary"):
-            with st.spinner("4분할 윈도우 In-Sample 최적화 -> OOS 블라인드 평가 중..."):
+        if st.button("진성 3D Walk-Forward(WFO) 분석 가동", type="primary"):
+            with st.spinner("4분할 윈도우 [Score x Trail x Hold] 27개 조합 탐색 -> OOS 블라인드 평가 중 (워밍업 정합성 보장)..."):
                 df_krx = load_krx_listing()
                 b_code, _ = find_stock_code(test_stock, df_krx)
                 if b_code:
                     s_date = (datetime.date.today() - datetime.timedelta(days=730)).strftime("%Y-%m-%d")
-                    df_bt = fdr.DataReader(b_code, s_date)
+                    df_bt = load_price_history(b_code, s_date)
                     dual_hist = load_historical_dual_regime(s_date)
                     frgn_hist = load_historical_foreign_series(b_code)
-                    wf_df = run_true_wfo(df_bt, dual_hist, historical_supply_series=frgn_hist)
+                    sec_name = get_sector_for_stock(b_code, df_krx)
+                    sec_df = load_sector_etf_series(sec_name, s_date)
+
+                    wf_df = run_multidimensional_wfo(df_bt, dual_hist, historical_supply_series=frgn_hist, sector_slice=sec_df)
                     st.markdown("#### 📊 Walk-Forward Efficiency (WFE) 결과")
                     st.dataframe(wf_df, width='stretch')
                 else:
                     st.error("종목을 찾을 수 없습니다.")
 
 # -------------------------------------------------------------
-# TAB 6: 시스템 무결성 헌장
+# TAB 6: 주린이 눈높이 실전 매뉴얼
 # -------------------------------------------------------------
 with tab6:
+    st.subheader("📘 주린이 전용 실전 매뉴얼: 이 화면을 어떻게 읽고 행동할까?")
+    st.caption("주가를 예측하지 않고, **언제 사고 / 어디서 도망치고 / 어디서 돈을 챙길지** 통제하는 자동 안전벨트 설명서입니다.")
+
+    st.markdown(r"""
+    ---
+    ### 1. 장 시작 전 필수 확인: 시장 신호등 (Market Regime)
+    화면 맨 위에 항상 떠 있는 배너는 **“지금 주식을 새로 사도 되는 날씨인가?”**를 알려주는 신호등입니다.
+
+    | 신호등 상태 | 시장 상태 설명 | 내가 취해야 할 행동 |
+    |---|---|---|
+    | **🟢 FAVORABLE (우호)** | 코스피/코스닥 둘 다 20일선 위에서 상승 중 | 추천된 권장 수량(100%) 매수 가능 |
+    | **🟡 NEUTRAL (중립/경계)** | 지수 하나가 흔들리거나 횡보 중 | 권장 매수 수량의 **절반(50%)만 매수** |
+    | **🔴 RISK-OFF (위험 회피)** | 주요 지수가 20일선 아래로 꺾인 하락장 | **신규 매수 전면 금지** (100점이어도 절대 매수 금지) |
+
+    ---
+    ### 2. STEP 1 진단 결과: 가격 4총사와 주문 수량 해석법
+
+    #### ① 진입 전략 트랙 (어떻게 살 것인가?)
+    * **MARKET (시장가/시가)**: 20일선 근처에서 안정적으로 지지받는 상태. 다음 날 아침 9시 장 시작 시가에 매수합니다.
+    * **PULLBACK (눌림목)**: 지금 바로 사지 말고, 주가가 20일선 부근까지 살짝 내려와 쉴 때 지정가로 매수 주문을 걸어둡니다.
+    * **BREAKOUT (돌파)**: 직전 20일 전고점을 거래량을 싣고 강하게 뚫고 올라갈 때 추격 매수합니다.
+
+    #### ② 가격 4총사 (내비게이션)
+    ```text
+      [2차 목표가: +2.0R]  ──  최초 수량의 40% 매도 & 트레일링 스탑 가동
+              ▲
+      [1차 목표가: +1.0R]  ──  전체 수량의 30% 확정 매도 & 손절선을 매수가(본전)로 상향
+              ▲
+      [진입 기준가]        ──  내가 실제로 주식을 사야 하는 기준 가격
+              ▼
+      [동적 손절선]        ──  주가가 여기까지 떨어지면 미련 없이 전량 매도 (-1.0R)
+    ```
+    * **동적 손절선**: "내가 틀렸음을 인정하는 가격". 주가가 이 가격을 터치하면 미련 없이 전량 매도하여 큰 손실을 차단합니다.
+    * **1차 목표가 (+1.0R)**: 손절폭만큼 수익이 난 지점. **가지고 있는 주식의 30%를 기계적으로 팔아 수익을 확정**하고, 남은 주식의 손절가를 **내가 산 가격(본전)**으로 수정합니다.
+    * **2차 목표가 (+2.0R)**: 손절폭의 2배 수익이 난 지점. **최초 매수 수량의 40%를 추가 매도**하고, 나머지 30% 잔여분은 고점에서 1.5 ATR 밀릴 때까지 계속 들고 갑니다(트레일링 스탑).
+
+    #### ③ 포지션 사이징: 왜 계좌 돈을 전부 안 쓰고 딱 'OO주'만 사라고 할까?
+    * **1R 원칙**: "한 번의 매매에서 내 계좌 전체 돈의 딱 1%까지만 잃겠다"는 철칙입니다.
+      * 예: 3,000만 원 계좌 $\rightarrow$ 1회 최대 손실액은 **30만 원**.
+      * 손절폭이 3,000원이면? `30만 원 ÷ 3,000원 = 딱 100주` 매수.
+      * 손절폭이 6,000원으로 크면? `30만 원 ÷ 6,000원 = 50주`로 알아서 수량을 절반으로 줄여줍니다.
+    * **수량 제한 요인**:
+      * `RISK_BUDGET`: 1% 손실 한도에 맞춘 수량.
+      * `WEIGHT_CAP`: 계좌 30% 비중 상한(몰빵 방지).
+      * `LIQUIDITY_CAP`: 거래대금이 적은 종목에 갇히지 않도록 일 거래대금의 1% 이내로 제한.
+
+    ---
+    ### 3. STEP 3 & 4 백테스트 성적표 읽는 법
+    "과거 2년 동안 이 규칙대로 매매했더라면 내 계좌가 어떻게 되었을까?"를 검증하는 성적표입니다.
+
+    | 지표 이름 | 초보자 눈높이 설명 | 기준 합격선 |
+    |---|---|---|
+    | **승률 (Win Rate)** | 10번 매매해서 몇 번 수익을 냈는가? | **45% ~ 55%** 면 충분히 훌륭함 (벌 때 크게 벌기 때문) |
+    | **일별 종가 MTM MDD** | 계좌 최고점 대비 가장 깊게 처박혔던 낙폭 | **-10% 이내**면 매우 우수, -15% 넘어가면 주의 |
+    | **Profit Factor (손익비)** | 번 돈 총합 ÷ 잃은 돈 총합 | **1.5 이상** 합격, **2.0 이상**이면 대단히 강력한 전략 |
+    | **기댓값 (Expectancy)** | 매매를 1번 완료할 때마다 계좌에 평균적으로 쌓이는 원화 | **플러스(+) 금액**이어야 함 |
+
+    * **⚡ 3-모드 동시 삼각비교(Tricorder)**:
+      * **보수적 (Worst-Case)**: 같은 날 목표가와 손절가를 둘 다 건드렸다면 **무조건 손절당했다고 가정한 결과**입니다.
+      * **판단 팁**: 보수적 모드에서도 **수익률이 플러스이고 Profit Factor가 1.3 이상**을 유지한다면 실전 노이즈를 넉넉히 이겨내는 탄탄한 종목입니다.
+
+    ---
+    ### 4. 실전 매매 당일 행동 체크리스트
+    1. **오전 8:30 (장 시작 전)**: 앱 상단 **시장 국면(Regime)**을 확인합니다. 빨간불(RISK-OFF)이면 매매하지 않고 쉽니다.
+    2. **오전 8:40 (종목 진단)**: STEP 1에서 **진입 트랙**, **가격 4총사**, **권장 매수 주수**를 메모합니다.
+    3. **오전 9:00 (장 시작)**: `MARKET`은 시가 체결, `PULLBACK`/`BREAKOUT`은 제시된 가격에 감시 주문을 걸어둡니다.
+    4. **체결 직후 (필수 습관)**: 주식이 사지자마자 증권사 앱에서 **동적 손절선 가격에 '자동 감시 매도(Stop Loss)'**를 걸어둡니다.
+    5. **장중 주가 상승 시**: 1차 목표가에 도달하면 30%를 팔고, 남은 주식의 손절가를 **매수가(본전)**로 수정합니다.
+    """)
+
+# -------------------------------------------------------------
+# TAB 7: 시스템 무결성 헌장
+# -------------------------------------------------------------
+with tab7:
     st.subheader("📖 QUANT-EXECUTION 무결성 실행 원칙")
     st.markdown(r"""
     1. **단일/포트폴리오 엔진 완전 일치 (Unified Core Execution)**:
        * 단일 종목 백테스트와 다종목 포트폴리오 백테스트는 오직 `check_3track_execution`과 `process_intraday_position` 공통 함수만을 공유합니다.
-       * 3-Track 진입 체결부터 +1.5R/+2.0R 이익보호, 1.5 ATR Trailing, Trend Break 청산까지 완전히 동일하게 작동합니다.
+       * 3-Track 진입 체결부터 +1.5R 도달 시 +0.5R 보호 스탑 상향, +2.0R 도달 시 +1.0R 보호 스탑 상향, 1.5 ATR Trailing, Trend Break 청산까지 완전히 동일하게 작동합니다.
     2. **전체 자산 기준 리스크 사이징 (Portfolio Equity Risk Basis)**:
        * 포트폴리오 백테스트 시 슬롯 배분 현금이 아닌 현재 포트폴리오 전체 총평가자산($Cash + \sum Value_{open}$)을 기준으로 1% 리스크와 단일 종목 30% 비중 상한을 계산하여 현실적 자본 할당을 구현합니다.
     3. **전면 슬리피지 및 다단계 분할 회계 원칙 (Full Friction Accounting)**:
        * 최종 청산 가격으로 전체 수익률을 왜곡하지 않고, $T_1(30\%)$, $T_2(40\%)$, 잔여분의 실제 매도 유입 현금을 각각 집계하며, 지정가 익절(0.05%) 및 시장가 청산(0.10%) 슬리피지를 전면 차감하여 손익비를 계산합니다.
     4. **정합적 손절 통제 원칙 (Harmonized Risk Defense)**:
-       * 손절선을 인위적인 범위(-2.5% ~ -7.5%)로 왜곡하지 않고 실제 구조/변동성 지지선에 정확히 배치하며, 리스크는 포지션 수량 조절을 최우선으로 하되 손절폭이 -8.5%를 초과하는 종목은 거래 자체를 거부(WAIT)하여 자본 회전율을 방어합니다.
+       * 가장 먼저 무너지는 핵심 지지선을 $max()$로 선택하되 최소 1.2 ATR 안전거리를 강제 확보하며, 손절폭이 -8.5%를 초과하는 종목은 거래 자체를 거부(WAIT)하여 자본 회전율을 방어합니다.
     5. **일별 종가 MTM 평가 기준 (Close-to-Close MTM Transparency)**:
        * 백테스트의 MDD 및 자산 곡선은 거래 종료 시점 기준이 아닌 매일 장 마감 종가 기준의 시가평가(MTM)로 측정되며, 장중 틱 단위 미세 낙폭은 배제된 일봉 기준 지표임을 명확히 규정합니다.
     6. **모호봉 삼각비교 원칙 (Tricorder Comparison Policy)**:
        * 당일 고가와 저가가 목표가와 손절가를 동시에 건드리는 모호한 일봉 발생 시, 보수적 모드(CONSERVATIVE), 중립 모드(NEUTRAL), 낙관 모드(OPTIMISTIC)를 동시 연산하여 안전 마진과 불확실성 델타를 명시합니다.
+    7. **전 종목 3단 계층 상대강도 및 진성 3D WFO (Universal 3-Tier RS & Multi-D WFO)**:
+       * KRX 전 종목 표준 업종을 5대 대표 ETF와 키워드 기반 추정 매핑하여 3단 상대강도를 매수 점수에 직접 반영하며, [Score x Trail x Hold] 27개 조합을 In-Sample에서 탐색한 뒤 60일 워밍업 정합성을 유지한 채 Out-of-Sample에 블라인드 동결 적용하여 전략의 영속성을 검증합니다.
     """)
