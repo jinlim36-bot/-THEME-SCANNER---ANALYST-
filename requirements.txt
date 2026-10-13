@@ -4,7 +4,4 @@ requests
 beautifulsoup4
 lxml
 finance-datareader>=0.9.102
-openai>=1.68.0
-
 numpy
-httpx

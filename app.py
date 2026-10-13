@@ -9,18 +9,12 @@ import math
 import logging
 from bs4 import BeautifulSoup
 import FinanceDataReader as fdr
-from openai import OpenAI, APIStatusError, APIConnectionError, APITimeoutError
-import os
-import httpx
-import re
 
 # =============================================================
 # [시스템 로깅 & 환경 설정]
 # =============================================================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("QuantExecutionProMax")
-
-DEFAULT_AI_MODEL = "gpt-4.1-mini"
 
 # KRX 주식 호가 단위: 각 구간 상한은 미포함 (ETF/ETN에는 별도 규칙 적용)
 KOREA_TICK_TABLE = [
@@ -57,101 +51,6 @@ st.set_page_config(
     page_icon="⚖️",
     layout="wide"
 )
-
-# -------------------------------------------------------------
-# 0. API 설정 & AI 설명 데스크
-# -------------------------------------------------------------
-secret_key = os.environ.get("OPENAI_API_KEY", "").strip()
-try:
-    if "OPENAI_API_KEY" in st.secrets:
-        secret_key = st.secrets["OPENAI_API_KEY"].strip()
-except Exception:
-    pass
-
-st.sidebar.header("⚙️ 시스템 설정")
-st.sidebar.caption("AI 진단 버전: AI-DIAG-3 · OpenAI GPT")
-input_key = st.sidebar.text_input("OpenAI API Key", value=secret_key, type="password")
-active_model = st.sidebar.text_input("OpenAI 모델", value=os.environ.get("OPENAI_MODEL", DEFAULT_AI_MODEL)).strip() or DEFAULT_AI_MODEL
-st.sidebar.caption("ChatGPT 구독과 OpenAI API 결제는 별개입니다. API 키는 대화에 공유하지 마세요.")
-active_key = input_key.strip() if input_key.strip() else secret_key
-
-client = None
-if active_key:
-    try:
-        client = OpenAI(api_key=active_key, timeout=30.0, max_retries=0)
-        st.sidebar.info("🔑 API 키 입력됨 · 연결은 브리핑 요청 시 확인합니다.")
-    except Exception as e:
-        client = None
-        st.sidebar.warning(f"AI 클라이언트 초기화 실패 ({type(e).__name__}). API 키 설정을 확인하세요.")
-
-def _safe_ai_error_message(message):
-    # SDK errors can contain request URLs or credentials; never expose them.
-    text = str(message or "")
-    if active_key:
-        text = text.replace(active_key, "[REDACTED]")
-    text = re.sub(r"(?:AIza[\w-]+|sk-[A-Za-z0-9_-]+)", "[REDACTED]", text)
-    text = re.sub(r"(?i)(key|api_key|x-goog-api-key|authorization)([\s:=]+)[^\s&,]+", r"\1\2[REDACTED]", text)
-    return text[:400]
-
-
-def _ai_response_reason(response):
-    if response is None:
-        return "응답 없음"
-    reasons = []
-    status = getattr(response, "status", None)
-    if status:
-        reasons.append(f"응답 상태: {status}")
-    incomplete = getattr(response, "incomplete_details", None)
-    if incomplete:
-        reasons.append(f"미완료 사유: {getattr(incomplete, 'reason', 'unknown')}")
-    for item in getattr(response, "output", None) or []:
-        for content in getattr(item, "content", None) or []:
-            if getattr(content, "type", None) == "refusal":
-                reasons.append("모델이 응답 생성을 거절했습니다.")
-    return "; ".join(reasons) or "텍스트 없는 응답"
-
-
-def generate_ai_briefing(client, prompt):
-    if not client:
-        return ""
-    hints = {
-        400: "요청 내용·모델 옵션을 확인하세요.",
-        401: "OpenAI API 키 인증을 확인하세요. Gemini 키는 사용할 수 없습니다.",
-        402: "OpenAI 프로젝트의 API 결제·크레딧 상태를 확인하세요.",
-        403: "프로젝트 권한과 모델 접근 제한을 확인하세요.",
-        404: "선택한 모델을 해당 프로젝트에서 사용할 수 있는지 확인하세요.",
-        429: "API 잔액·프로젝트 예산·요청 제한을 확인하세요. ChatGPT 구독과 별개입니다.",
-        500: "OpenAI 서버 오류입니다. 잠시 후 다시 시도하세요.",
-        503: "OpenAI가 일시적으로 응답할 수 없습니다. 잠시 후 다시 시도하세요.",
-    }
-    try:
-        response = client.responses.create(
-            model=active_model, input=prompt, max_output_tokens=800, store=False
-        )
-        text = getattr(response, "output_text", None)
-        if text and text.strip() and getattr(response, "status", "completed") == "completed":
-            st.caption(f"OpenAI GPT 응답 성공 · 모델: {active_model}")
-            return text
-        detail = _ai_response_reason(response)
-    except APIStatusError as error:
-        detail = f"API 오류 {error.status_code}: {_safe_ai_error_message(error.message)}"
-        detail += " " + hints.get(error.status_code, "API 오류 내용을 확인하세요.")
-    except APITimeoutError:
-        detail = "Timeout: OpenAI 응답 대기 시간이 초과됐습니다."
-    except APIConnectionError as error:
-        if isinstance(error.__cause__, httpx.ProxyError) or type(error.__cause__).__name__ == "ProxyError":
-            detail = "ProxyError: OpenAI 요청의 프록시 연결이 실패했습니다. api.openai.com 접근을 확인하세요."
-        else:
-            detail = "APIConnectionError: OpenAI 네트워크·TLS 연결과 api.openai.com 접근을 확인하세요."
-    except Exception as error:
-        detail = f"{type(error).__name__}: AI 요청 처리 중 예기치 않은 오류가 발생했습니다."
-    detail = _safe_ai_error_message(detail)
-    logger.warning("OpenAI briefing failed [%s]: %s", active_model, detail)
-    st.warning("AI 브리핑 요청 실패. 아래 진단을 확인하세요.")
-    with st.expander("AI 브리핑 실패 진단", expanded=True):
-        st.text(f"{active_model}: {detail}")
-    return f"AI 브리핑을 생성할 수 없습니다.\n\n진단 버전: AI-DIAG-3\n\n{active_model}: {detail}"
-
 
 @st.cache_data(ttl=3600)
 def load_price_history(symbol, start_date):
@@ -1509,22 +1408,6 @@ with tab1:
                     p2.metric("수량 제한 요인", pos["limiting_factor"], f"실질 리스크: {pos['real_risk_pct']}%")
                     p3.metric("정상 손절 시 손실액", f"-{pos['normal_risk_loss']:,}원", "1R 원칙 통제")
                     p4.metric("스트레스 갭다운(-1ATR)", f"-{pos['worst_gap_loss']:,}원", "오버나이트 급락 가정", delta_color="inverse")
-
-                    if client:
-                        prompt = f"""
-                        당신은 엄격한 퀀트 트레이딩 데스크의 리스크 통제 총괄입니다.
-                        다음 정량 데이터를 바탕으로 {name}({code})의 기계적 매매 지침을 브리핑하세요.
-                        - 듀얼 시장 국면: {dual_regime['status']} (실행 배수 {verdict['multiplier']}x)
-                        - 퀀트 평가: {scored['score']}점 ({scored['grade']}), 추천 트랙: {scored['track']}
-                        - 진입 기준가: {curr_price:,}원 / 손절가: {levels['stop_price']:,}원 ({levels['loss_pct']}%)
-                        - 1차 목표가: {levels['target_1r']:,}원 / 2차 목표가: {levels['target_2r']:,}원
-                        - 권장 주문 수량: {pos['shares']}주 (제약요인: {pos['limiting_factor']}, 정상 손실 -{pos['normal_risk_loss']:,}원)
-                        - 저항선 경고: {levels['resistance_warning']}
-                        *과도한 낙관을 배제하고 자본 보존과 손익비 관점에서 3~4문장으로 서술하세요.*
-                        """
-                        with st.spinner("AI 리스크 브리핑 작성 중..."):
-                            rep = generate_ai_briefing(client, prompt)
-                            st.info(f"**AI 리스크 브리핑**:\n\n{rep}")
 
 # -------------------------------------------------------------
 # TAB 2: 코스피 Buy Zone 스크리너 (수급 정합성 옵션 추가)
