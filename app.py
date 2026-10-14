@@ -4,10 +4,8 @@ import numpy as np
 import datetime
 import requests
 import io
-import time
 import math
 import logging
-from bs4 import BeautifulSoup
 import FinanceDataReader as fdr
 
 # =============================================================
@@ -300,49 +298,45 @@ def find_stock_code(query, df_krx):
         if not matched.empty: return matched.iloc[0]['Code'], matched.iloc[0]['Name']
     return None, None
 
-def get_sector_for_stock(code, df_krx=None):
-    """
-    [신규] KRX 표준 업종명을 분석하여 5대 대표 ETF 섹터로 키워드 기반 추정 매핑
-    """
+def build_sector_lookup(df_krx=None):
     master = load_all_krx_master()
-    raw_sec = ""
-    if not master.empty and 'Sector_Raw' in master.columns:
-        m = master[master['Code'] == code]
-        if not m.empty:
-            raw_sec = str(m.iloc[0]['Sector_Raw'])
+    raw_sectors = {}
+    for data, column in ((df_krx, 'Sector'), (master, 'Sector_Raw')):
+        if data is not None and not data.empty and {'Code', column}.issubset(data.columns):
+            for code, sector in zip(data['Code'], data[column]):
+                if pd.notna(sector) and str(sector).strip():
+                    raw_sectors[str(code).zfill(6)] = str(sector)
+    return {code: next((mapped for keyword, mapped in KRX_INDUSTRY_KEYWORD_MAP.items()
+                        if keyword in sector), '대표지수')
+            for code, sector in raw_sectors.items()}
 
-    if not raw_sec and df_krx is not None and not df_krx.empty and 'Sector' in df_krx.columns:
-        m2 = df_krx[df_krx['Code'] == code]
-        if not m2.empty:
-            raw_sec = str(m2.iloc[0]['Sector'])
 
-    for keyword, mapped_sec in KRX_INDUSTRY_KEYWORD_MAP.items():
-        if keyword in raw_sec:
-            return mapped_sec
-    return "대표지수"
+def get_sector_for_stock(code, df_krx=None, sector_lookup=None):
+    """Use one industry snapshot per scan; unknown industries use the index ETF."""
+    if sector_lookup is None:
+        sector_lookup = build_sector_lookup(df_krx)
+    return sector_lookup.get(str(code).zfill(6), '대표지수')
+
 
 def get_supply_data(code):
     headers = {"User-Agent": "Mozilla/5.0"}
-    res_data = {"frgn_5": None, "inst_5": None, "status": "FAIL"}
+    res_data = {"frgn_5": None, "status": "FAIL"}
     try:
         url = f"https://finance.naver.com/item/frgn.naver?code={code}"
         res = requests.get(url, headers=headers, timeout=4)
         if res.status_code == 200:
             dfs = pd.read_html(io.BytesIO(res.content), encoding="cp949")
-            df_frgn = next((t for t in dfs if "기관" in str(t.columns) and "외국인" in str(t.columns)), None)
+            df_frgn = next((t for t in dfs if any("외국인" in str(c) and "순매" in str(c) for c in t.columns)), None)
             if df_frgn is not None:
                 df_frgn.columns = ['_'.join(c).strip() if isinstance(c, tuple) else str(c) for c in df_frgn.columns]
-                i_cols = [c for c in df_frgn.columns if "기관" in c and "순매" in c]
                 f_cols = [c for c in df_frgn.columns if "외국인" in c and "순매" in c]
-                if i_cols and f_cols:
-                    iv = pd.to_numeric(df_frgn[i_cols[0]].astype(str).str.replace(',', ''), errors='coerce').dropna().tolist()
+                if f_cols:
                     fv = pd.to_numeric(df_frgn[f_cols[0]].astype(str).str.replace(',', ''), errors='coerce').dropna().tolist()
-                    if len(iv) >= 5 and len(fv) >= 5:
-                        res_data["inst_5"] = int(sum(iv[:5]))
+                    if len(fv) >= 5:
                         res_data["frgn_5"] = int(sum(fv[:5]))
                         res_data["status"] = "OK"
-    except Exception:
-        pass
+    except Exception as error:
+        logger.warning('Foreign supply unavailable [%s]: %s', code, type(error).__name__)
     return res_data
 
 @st.cache_data(ttl=86400)
@@ -373,16 +367,14 @@ def load_historical_foreign_series(code, pages=18):
     total_df.index = pd.to_datetime(total_df.index).normalize()
     return total_df['Net_Frgn'].rolling(5).sum()
 
-@st.cache_data(ttl=86400)
 def load_sector_etf_series(sector_name, start_date="2022-01-01"):
     etf_code = SECTOR_ETF_MAP.get(sector_name, "069500")
     try:
         df = load_price_history(etf_code, start_date)
         if df is not None and not df.empty:
-            df.index = pd.to_datetime(df.index).normalize()
             return df[['Close']]
-    except Exception:
-        pass
+    except Exception as error:
+        logger.warning('Sector ETF data unavailable [%s]: %s', etf_code, type(error).__name__)
     return pd.DataFrame()
 
 # -------------------------------------------------------------
@@ -580,7 +572,8 @@ def blocked_decision(reason):
             'scored': scored, 'levels': levels, 'multiplier': 0.0}
 
 
-def evaluate_full_execution_pipeline(df_slice, regime_code, kospi_slice=None, sector_slice=None, has_frgn=False, min_score=70):
+def evaluate_execution_features(df_slice, regime_code, kospi_slice=None, sector_slice=None, has_frgn=False):
+    """Validate and compute date-specific features, independent of entry thresholds."""
     if not valid_price_history(df_slice, min_rows=60):
         return blocked_decision('60거래일의 유효한 OHLCV 데이터가 부족하여 신규 매수를 보류합니다.')
     if regime_code not in {'FAVORABLE', 'NEUTRAL', 'RISK-OFF'}:
@@ -594,6 +587,14 @@ def evaluate_full_execution_pipeline(df_slice, regime_code, kospi_slice=None, se
     if levels["atr14"] <= 0:
         return blocked_decision("변동성 산출 데이터가 부족하여 신규 매수를 보류합니다.")
 
+    return {'scored': scored, 'levels': levels}
+
+
+def decide_execution(features, regime_code, min_score=70):
+    """Apply the entry policy without changing shared feature dictionaries."""
+    if 'action' in features:
+        return dict(features)
+    scored, levels = features['scored'], features['levels']
     if scored["score"] < min_score:
         return {"action": "WAIT", "badge": f"🟡 {scored['grade']} ({scored['score']}점)", "reason": f"기준 점수({min_score}점) 미달", "scored": scored, "levels": levels, "multiplier": 0.0}
 
@@ -606,6 +607,11 @@ def evaluate_full_execution_pipeline(df_slice, regime_code, kospi_slice=None, se
         return {"action": "BUY_REDUCED", "badge": f"🟡 BUY (비중 50% 축소 | {scored['score']}점)", "reason": "시장 중립 국면. 자본 리스크 통제를 위해 수량을 50%로 축소 집행합니다.", "scored": scored, "levels": levels, "multiplier": 0.5}
     else:
         return {"action": "BUY", "badge": f"🟢 BUY (정상 진입 | {scored['score']}점)", "reason": f"시장 우호 + 100점 만점 통과({scored['score']}점). 정상 진입을 승인합니다.", "scored": scored, "levels": levels, "multiplier": 1.0}
+
+def evaluate_full_execution_pipeline(df_slice, regime_code, kospi_slice=None, sector_slice=None, has_frgn=False, min_score=70):
+    features = evaluate_execution_features(df_slice, regime_code, kospi_slice, sector_slice, has_frgn)
+    return decide_execution(features, regime_code, min_score)
+
 
 def expected_stop_risk(entry_price, stop_price, buy_fee=0.0005, sell_fee=0.0020, market_slippage=0.0010):
     """Planned unit loss including costs; gaps beyond the stop are not bounded."""
@@ -913,9 +919,11 @@ def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_hol
 # 8. [단일 종목] 일별 MTM 모의 백테스터 (eval_start_date 워밍업 완결)
 # -------------------------------------------------------------
 def run_daily_mtm_backtest(df_hist, df_dual_regime, historical_supply_series=None, sector_slice=None, max_holding=10, initial_capital=30000000, risk_pct=1.0,
-                           buy_cost=0.05, sell_cost=0.20, market_slippage=0.0010, limit_slippage=0.0005, execution_mode="CONSERVATIVE", min_score=70, trail_atr_mult=1.5, eval_start_date=None):
+                           buy_cost=0.05, sell_cost=0.20, market_slippage=0.0010, limit_slippage=0.0005, execution_mode="CONSERVATIVE", min_score=70, trail_atr_mult=1.5, eval_start_date=None, _feature_cache=None):
     """
-    [수정] eval_start_date가 지정되면 직전 60일 데이터로 지표를 워밍업하고 지정일 첫날부터 OOS 거래를 개시
+    eval_start_date 이전 종가로 첫 거래일 주문을 준비한다.
+    _feature_cache는 동일한 입력·워밍업 구간의 WFO 조합에서만 공유한다.
+    포지션, 수량, 체결, 현금 흐름은 각 조합에서 독립적으로 계산한다.
     """
     if len(df_hist) < 61 or not valid_price_history(df_hist, min_rows=len(df_hist)) or df_dual_regime.empty: return pd.DataFrame(), pd.DataFrame(), {}
 
@@ -926,6 +934,7 @@ def run_daily_mtm_backtest(df_hist, df_dual_regime, historical_supply_series=Non
     df_reg = df_dual_regime.copy()
     df_reg.index = pd.to_datetime(df_reg.index).normalize()
     df_reg = df_reg.loc[~df_reg.index.duplicated(keep="last")].sort_index()
+    market_history = df_reg[['KS_Close']].rename(columns={'KS_Close': 'Close'})
 
     buy_fee = buy_cost / 100.0
     sell_fee = sell_cost / 100.0
@@ -1015,19 +1024,28 @@ def run_daily_mtm_backtest(df_hist, df_dual_regime, historical_supply_series=Non
 
         # D. 장 마감 후 익일 시그널 평가
         if active_pos is None and pending_entry is None:
-            reg_code = regime_at(df_reg, cur_date)
-            ks_sub = df_reg[['KS_Close']].rename(columns={'KS_Close': 'Close'}).loc[:cur_date]
-            sec_sub = sector_slice.loc[:cur_date] if sector_slice is not None else None
+            if _feature_cache is not None and cur_date in _feature_cache:
+                reg_code, features = _feature_cache[cur_date]
+                dec = decide_execution(features, reg_code, min_score)
+            else:
+                reg_code = regime_at(df_reg, cur_date)
+                ks_sub = market_history.loc[:cur_date]
+                sec_sub = sector_slice.loc[:cur_date] if sector_slice is not None else None
 
-            has_frgn = False
-            if historical_supply_series is not None and not historical_supply_series.empty:
-                if cur_date in historical_supply_series.index:
-                    has_frgn = bool(historical_supply_series.loc[cur_date] > 0)
+                has_frgn = False
+                if historical_supply_series is not None and not historical_supply_series.empty:
+                    if cur_date in historical_supply_series.index:
+                        has_frgn = bool(historical_supply_series.loc[cur_date] > 0)
+                    else:
+                        past_s = historical_supply_series.loc[historical_supply_series.index <= cur_date]
+                        if not past_s.empty and (cur_date - past_s.index[-1]).days <= 7: has_frgn = bool(past_s.iloc[-1] > 0)
+
+                if _feature_cache is None:
+                    dec = evaluate_full_execution_pipeline(df_p.iloc[:idx+1], reg_code, kospi_slice=ks_sub, sector_slice=sec_sub, has_frgn=has_frgn, min_score=min_score)
                 else:
-                    past_s = historical_supply_series.loc[historical_supply_series.index <= cur_date]
-                    if not past_s.empty and (cur_date - past_s.index[-1]).days <= 7: has_frgn = bool(past_s.iloc[-1] > 0)
-
-            dec = evaluate_full_execution_pipeline(df_p.iloc[:idx+1], reg_code, kospi_slice=ks_sub, sector_slice=sec_sub, has_frgn=has_frgn, min_score=min_score)
+                    features = evaluate_execution_features(df_p.iloc[:idx+1], reg_code, kospi_slice=ks_sub, sector_slice=sec_sub, has_frgn=has_frgn)
+                    _feature_cache[cur_date] = (reg_code, features)
+                    dec = decide_execution(features, reg_code, min_score)
             if "BUY" in dec["action"]:
                 pending_entry = {
                     "regime": reg_code,
@@ -1381,6 +1399,9 @@ def run_multidimensional_wfo(df_hist, df_dual_regime, historical_supply_series=N
         best_params = None
         best_is_fitness = -999999.0
         best_is_met = None
+        default_is_result = None
+        # Private to this exact training slice; never reused across windows or OOS.
+        feature_cache = {}
 
         # 1. IS 27개 3D 조합 전수 탐색
         for sc in grid_scores:
@@ -1388,8 +1409,11 @@ def run_multidimensional_wfo(df_hist, df_dual_regime, historical_supply_series=N
                 for hd in grid_holds:
                     is_daily, _, m_tr = run_daily_mtm_backtest(
                         df_train_with_warmup, df_dual_regime, historical_supply_series=historical_supply_series, sector_slice=sector_slice,
-                        initial_capital=initial_capital, min_score=sc, max_holding=hd, trail_atr_mult=tr_mult, eval_start_date=is_eval_start
+                        initial_capital=initial_capital, min_score=sc, max_holding=hd, trail_atr_mult=tr_mult, eval_start_date=is_eval_start,
+                        _feature_cache=feature_cache
                     )
+                    if (sc, tr_mult, hd) == (70, 1.5, 10):
+                        default_is_result = (is_daily, m_tr)
                     if m_tr and m_tr['total_trades'] >= min_is_trades and m_tr['total_return_pct'] > 0:
                         fitness = (m_tr['total_return_pct'] / max(m_tr.get('daily_mdd', 0), 1)
                                    * math.log(m_tr['total_trades'] + 1))
@@ -1402,7 +1426,7 @@ def run_multidimensional_wfo(df_hist, df_dual_regime, historical_supply_series=N
         selection_qualified = best_params is not None
         if not best_params:
             best_params = (70, 1.5, 10)
-            is_daily, _, best_is_met = run_daily_mtm_backtest(df_train_with_warmup, df_dual_regime, historical_supply_series=historical_supply_series, sector_slice=sector_slice, initial_capital=initial_capital, eval_start_date=is_eval_start)
+            is_daily, best_is_met = default_is_result
 
             best_is_days = len(is_daily)
 
@@ -1452,9 +1476,40 @@ def run_multidimensional_wfo(df_hist, df_dual_regime, historical_supply_series=N
 # -------------------------------------------------------------
 # [UI 라우팅 및 뷰 구성]
 # -------------------------------------------------------------
-if st.sidebar.button('시세·시장 데이터 새로 조회'):
+def invalidate_scan_results():
+    for key in ('screened_res', 'screened_meta', 'scan_stock_choice'):
+        st.session_state.pop(key, None)
+
+
+def refresh_market_data():
     st.cache_data.clear()
-    st.rerun()
+    invalidate_scan_results()
+
+
+def scan_result_context(regime, min_cap, scan_pool, include_supply):
+    return (str(market_today()), regime.get('data_date'), regime['code'],
+            regime['multiplier'], min_cap, scan_pool, include_supply)
+
+
+def scan_results_are_current(metadata, context):
+    if not metadata or metadata.get('context') != context:
+        return False
+    age = datetime.datetime.now(datetime.timezone.utc).timestamp() - metadata.get('created_at', 0)
+    return 0 <= age < 3600
+
+
+def transfer_scanned_stock():
+    metadata = st.session_state.get('screened_meta')
+    if not scan_results_are_current(metadata, metadata.get('context') if metadata else None):
+        invalidate_scan_results()
+        return
+    selected = st.session_state['scan_stock_choice']
+    st.session_state['selected_stock'] = selected
+    for key in ('diagnosis_stock', 'backtest_stock', 'stress_stock'):
+        st.session_state[key] = selected
+
+
+st.sidebar.button('시세·시장 데이터 새로 조회', on_click=refresh_market_data)
 
 dual_regime = get_current_dual_regime()
 
@@ -1470,6 +1525,8 @@ st.caption(f"시장 데이터 기준일: {dual_regime.get('data_date') or '확�
 
 if "selected_stock" not in st.session_state:
     st.session_state["selected_stock"] = "삼성전자"
+for stock_key in ('diagnosis_stock', 'backtest_stock', 'stress_stock'):
+    st.session_state.setdefault(stock_key, st.session_state['selected_stock'])
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 STEP 1 · 실행 중심 퀀트 진단 & 포지션 계산",
@@ -1497,7 +1554,7 @@ with tab1:
 
     col1, col2, col3 = st.columns([2, 1.5, 1])
     with col1:
-        target_stock = st.text_input("종목명 또는 6자리 코드", value=st.session_state["selected_stock"])
+        target_stock = st.text_input("종목명 또는 6자리 코드", key="diagnosis_stock")
     with col2:
         acc_cap = st.number_input("내 총 계좌 잔고 (원)", min_value=1000000, value=30000000, step=5000000)
     with col3:
@@ -1596,7 +1653,14 @@ with tab2:
     with c_s3:
         include_supply_in_scan = st.checkbox("외국인 수급 5점 결합 (정밀 스캔)", value=False, help="체크 시 종목별 최근 수급을 조회하여 STEP 1과 동일한 수급 가점을 적용합니다. 조회 시점·데이터 차이로 점수가 다를 수 있습니다 (약간의 로딩 시간 소요).")
 
+    scan_context = scan_result_context(dual_regime, min_cap, scan_pool, include_supply_in_scan)
+    if "screened_res" in st.session_state and not scan_results_are_current(
+            st.session_state.get('screened_meta'), scan_context):
+        invalidate_scan_results()
+        st.info('조회 조건·시장 상태가 변경되었거나 결과가 만료되었습니다. 다시 스캔하세요.')
+
     if st.button("Buy Zone 종목 스캔 시작", type="primary"):
+        invalidate_scan_results()
         with st.spinner("코스피 후보군 100점 평가 및 섹터 RS 자동 검증 중..."):
             df_k = load_stock_listing('KOSPI')
             df_krx = load_krx_listing()
@@ -1612,6 +1676,9 @@ with tab2:
 
                 pool = df_k[df_k['Marcap'] >= (min_cap * 100000000)].sort_values(by="Amount", ascending=False).head(scan_pool)
                 screened = []
+                sector_lookup = build_sector_lookup(df_krx)
+                scan_counts = {'evaluated': 0, 'missing': 0, 'failed': 0, 'supply_missing': 0}
+                scan_errors = {}
                 p_bar = st.progress(0)
                 s_date = (market_today() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
                 df_ks = load_price_history('KS11', s_date)
@@ -1621,22 +1688,30 @@ with tab2:
                     code, name = str(r['Code']).zfill(6), r['Name']
                     try:
                         h = load_price_history(code, s_date)
-                        if h is None or len(h) < 30: continue
+                        if not valid_price_history(h, min_rows=60):
+                            scan_counts['missing'] += 1
+                            continue
 
-                        sec_name = get_sector_for_stock(code, df_krx)
+                        sec_name = get_sector_for_stock(code, df_krx, sector_lookup=sector_lookup)
                         sec_df = load_sector_etf_series(sec_name, s_date)
 
                         has_frgn = False
                         if include_supply_in_scan:
                             sup = get_supply_data(code)
-                            has_frgn = (sup["frgn_5"] is not None and sup["frgn_5"] > 0)
+                            has_frgn = (sup["status"] == "OK" and sup["frgn_5"] is not None and sup["frgn_5"] > 0)
+                            if sup['status'] != 'OK':
+                                scan_counts['supply_missing'] += 1
 
                         dec = evaluate_full_execution_pipeline(h, dual_regime["code"], kospi_slice=df_ks, sector_slice=sec_df, has_frgn=has_frgn)
+                        if dec['scored']['grade'] == 'UNVERIFIED':
+                            scan_counts['missing'] += 1
+                            continue
+                        scan_counts['evaluated'] += 1
                         if "BUY" in dec["action"]:
                             c_p = int(h['Close'].iloc[-1])
                             lvs = dec["levels"]
                             screened.append({
-                                "코드": code, "종목명": name, "현재가": c_p,
+                                "코드": code, "종목명": name, "현재가": c_p, "시세기준일": h.index[-1].strftime("%Y-%m-%d"),
                                 "스코어": f"{dec['scored']['score']}점",
                                 "트랙": dec['scored']['track'],
                                 "매핑섹터": sec_name,
@@ -1644,24 +1719,45 @@ with tab2:
                                 "손절폭(%)": lvs["loss_pct"], "1차목표(1R)": lvs["target_1r"],
                                 "2차목표(2R)": lvs["target_2r"], "거래대금(억)": int(r['Amount'] / 100000000)
                             })
-                    except Exception:
-                        continue
+                    except Exception as error:
+                        scan_counts['failed'] += 1
+                        error_type = type(error).__name__
+                        scan_errors[error_type] = scan_errors.get(error_type, 0) + 1
+                        logger.warning('Scanner evaluation failed [%s]: %s', code, error_type)
                 p_bar.empty()
                 df_res = pd.DataFrame(screened)
                 st.session_state["screened_res"] = df_res
+                st.session_state['screened_meta'] = {
+                    'context': scan_context,
+                    'created_at': datetime.datetime.now(datetime.timezone.utc).timestamp(),
+                    'counts': scan_counts, 'errors': scan_errors,
+                }
                 if not df_res.empty:
                     st.success(f"조건을 만족하는 **{len(df_res)}개 종목**이 포착되었습니다.")
+                elif scan_counts['evaluated']:
+                    st.warning("평가를 완료한 종목 중 매수 요건을 충족하는 종목이 없습니다.")
                 else:
-                    st.warning("현재 매수 요건을 충족하는 종목이 없습니다.")
+                    st.warning("평가 가능한 종목이 없습니다. 데이터 조회 상태와 후보 조건을 확인하세요.")
+
+    if 'screened_meta' in st.session_state:
+        scan_meta = st.session_state['screened_meta']
+        counts = scan_meta['counts']
+        scanned_at = datetime.datetime.fromtimestamp(
+            scan_meta['created_at'], datetime.timezone(datetime.timedelta(hours=9)))
+        st.caption(f"스캔 완료: {scanned_at:%Y-%m-%d %H:%M:%S} KST · 시장 기준일: {dual_regime.get('data_date') or '확인 불가'} · "
+                   f"평가 완료 {counts['evaluated']}개 / 데이터 미확인 {counts['missing']}개 / 처리 실패 {counts['failed']}개")
+        if counts['supply_missing']:
+            st.caption(f"외국인 수급 미확인 {counts['supply_missing']}개: 수급 가점 없이 평가했습니다.")
+        if scan_meta['errors']:
+            st.warning('일부 종목 처리 실패: ' + ', '.join(f'{name} {count}건' for name, count in scan_meta['errors'].items()))
 
     if "screened_res" in st.session_state and not st.session_state["screened_res"].empty:
         df_show = st.session_state["screened_res"]
         st.dataframe(df_show, width='stretch')
 
-        sel = st.selectbox("진단 탭으로 전송할 종목 선택", df_show["종목명"].tolist())
-        if st.button("선택 종목을 STEP 1으로 전송"):
-            st.session_state["selected_stock"] = sel
-            st.info(f"'{sel}' 선택 완료. **STEP 1** 탭으로 이동하세요.")
+        st.selectbox("진단 탭으로 전송할 종목 선택", df_show["종목명"].tolist(), key="scan_stock_choice")
+        if st.button("선택 종목을 STEP 1으로 전송", on_click=transfer_scanned_stock):
+            st.info(f"'{st.session_state['selected_stock']}' 선택 완료. 진단·백테스트·스트레스 검증 탭에 반영했습니다.")
 
 # -------------------------------------------------------------
 # TAB 3: 단일 종목 실계좌 MTM 백테스트 & 3-모드 삼각비교
@@ -1670,7 +1766,7 @@ with tab3:
     st.subheader("단일 종목 일별 시가평가(Daily MTM) 모의 백테스트")
     st.caption("일봉 체결 후 고저 순서는 알 수 없어 체결 모드별 가정을 적용합니다. 3-Track 모의 체결, 부분익절 누적 현금흐름 완결 회계, 과거 5일 외국인 수급 및 전 종목 자동 Sector RS를 동시 반영합니다.")
 
-    bt_stock = st.text_input("백테스트 대상 종목명 또는 코드", value=st.session_state["selected_stock"])
+    bt_stock = st.text_input("백테스트 대상 종목명 또는 코드", key="backtest_stock")
     c_b1, c_b2, c_b3, c_b4 = st.columns(4)
     with c_b1:
         bt_init_cap = st.number_input("시뮬레이션 초기 자본금 (원)", value=30000000, step=5000000)
@@ -1810,7 +1906,7 @@ with tab5:
     st.subheader("🔬 진성 3D Walk-Forward Optimization (WFO) & 슬리피지 부하 검증")
     st.caption("IS에서 [Score x Trail x Hold] 27개 조합을 탐색하고 OOS에서 고정 평가합니다. 60거래일 워밍업과 일별 복리 수익률 기준 WFE를 사용합니다. IS 최소 20건·OOS 최소 10건의 청산 거래가 필요합니다.")
 
-    test_stock = st.text_input("검증 대상 종목명 또는 코드", value=st.session_state["selected_stock"], key="stress_stock")
+    test_stock = st.text_input("검증 대상 종목명 또는 코드", key="stress_stock")
 
     col_t1, col_t2 = st.columns(2)
     with col_t1:
