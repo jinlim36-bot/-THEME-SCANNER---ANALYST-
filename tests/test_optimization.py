@@ -8,13 +8,13 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from test_engine import history, load_engine
+from test_engine import history, rebound_history, load_engine
 
 
 class OptimizationTests(unittest.TestCase):
     def setUp(self):
         self.e = load_engine()
-        self.df = history(180)
+        self.df = rebound_history(180)
         self.reg = pd.DataFrame({'Regime': 'FAVORABLE', 'KS_Close': self.df.Close}, index=self.df.index)
 
     def assert_backtests_equal(self, left, right):
@@ -47,6 +47,7 @@ class OptimizationTests(unittest.TestCase):
                 self.e['evaluate_execution_features'] = observe
                 optimized = self.e['run_daily_mtm_backtest'](self.df, reg, _feature_cache=cache, **args)
                 self.assert_backtests_equal(reference, optimized)
+                self.assertGreater(len(reference[1]), 0)
         self.assertEqual(len(computed_dates), len(set(computed_dates)))
         self.assertGreater(len(cache), 0)
 

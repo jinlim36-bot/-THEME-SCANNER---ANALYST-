@@ -36,6 +36,15 @@ def history(size=420):
                          'Volume': np.full(size, 1000000)}, index=dates)
 
 
+def rebound_history(size=420):
+    """Rising MA20 with repeated support tests, bullish recovery and later triggers."""
+    dates = pd.bdate_range('2024-01-01', periods=size)
+    idx = np.arange(size)
+    close = 10000 + idx * 10
+    return pd.DataFrame({'Open': close - 30, 'High': close + np.where(idx % 3 == 0, 70, 10),
+                         'Low': close - 120, 'Close': close, 'Volume': 1000000}, index=dates)
+
+
 class EngineTests(unittest.TestCase):
     def setUp(self):
         self.e = load_engine()
@@ -61,7 +70,7 @@ class EngineTests(unittest.TestCase):
                     self.assertEqual(plain[key], fast[key])
 
     def test_portfolio_uses_historic_supply_and_preserves_cash(self):
-        data = self.df.copy()
+        data = rebound_history()
         data.index = pd.bdate_range(end=datetime.date.today(), periods=len(data))
         reg = pd.DataFrame({'Regime': 'FAVORABLE', 'KS_Close': data.Close}, index=data.index)
         self.e['load_price_history'] = lambda *args: data.copy()
