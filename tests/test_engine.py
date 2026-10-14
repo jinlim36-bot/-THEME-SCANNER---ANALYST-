@@ -2,6 +2,8 @@
 import ast
 import datetime
 import logging
+import json
+import uuid
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +24,7 @@ def load_engine():
     for node in nodes:
         if isinstance(node, ast.FunctionDef):
             node.decorator_list = []
-    scope = dict(pd=pd, np=np, math=math, datetime=datetime,
+    scope = dict(pd=pd, np=np, math=math, datetime=datetime, json=json, uuid=uuid,
                  logger=logging.getLogger('engine-test'))
     exec(compile(ast.Module(body=nodes, type_ignores=[]), 'app.py', 'exec'), scope)
     return scope

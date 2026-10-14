@@ -6,6 +6,8 @@ import requests
 import io
 import math
 import logging
+import json
+import uuid
 import FinanceDataReader as fdr
 
 # =============================================================
@@ -657,9 +659,7 @@ def calculate_execution_levels(df_slice, entry_price, invalidation_price=None):
     loss_pct = round(((stop_price - curr_p) / curr_p) * 100, 2)
     is_excessive_stop = (curr_p - stop_price) / curr_p >= 0.085
 
-    target_1r = ceil_to_tick(curr_p + 1.0 * risk_1r)
-    target_2r = ceil_to_tick(curr_p + 2.0 * risk_1r)
-    target_3r = ceil_to_tick(curr_p + 3.0 * risk_1r)
+    target_1r, target_2r, target_3r = exit_targets(curr_p, stop_price)
 
     reward_to_resist = high_20 - curr_p
     rrr_to_resist = round(reward_to_resist / risk_1r, 2) if risk_1r > 0 else 0.0
@@ -950,6 +950,236 @@ def check_3track_execution(track, b_open, b_high, b_low, ma20_entry, high_20, sl
             return True, ceil_to_tick(exec_p)
     return False, 0.0
 
+def partial_exit_quantities(quantity):
+    first = min(quantity, max(1, int(quantity * .30)))
+    second = min(quantity - first, max(1, int(quantity * .40)))
+    return first, second
+
+
+def exit_targets(entry, stop):
+    risk = entry - stop
+    return tuple(ceil_to_tick(entry + multiple * risk) for multiple in (1, 2, 3))
+
+
+def protection_stop(entry, risk, current_stop, peak, atr, first_done, second_done, trail=1.5):
+    result = current_stop
+    if first_done:
+        result = max(result, entry)
+        if peak >= entry + 1.5 * risk:
+            result = max(result, floor_to_tick(entry + .5 * risk))
+    if second_done:
+        result = max(result, floor_to_tick(entry + risk))
+        if atr > 0:
+            result = max(result, floor_to_tick(peak - trail * atr))
+    return result
+
+
+def closing_exit_reason(close, ma5, previous_low, days, first_done, max_days=10):
+    if first_done and close < ma5 and close < previous_low:
+        return 'TREND_BREAK_EXIT'
+    if days >= max_days:
+        return 'TIME_STOP'
+    return None
+
+
+def validate_record_date(value):
+    try:
+        date = datetime.date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        raise ValueError('날짜는 YYYY-MM-DD 형식이어야 합니다.')
+    if date > market_today():
+        raise ValueError('미래의 체결·변경 날짜는 등록할 수 없습니다.')
+    return date.isoformat()
+
+
+def positive_record_number(value, label, whole=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value <= 0:
+        raise ValueError(f'{label}은 양수여야 합니다.')
+    if whole and int(value) != value:
+        raise ValueError(f'{label}은 정수여야 합니다.')
+    return int(value) if whole else float(value)
+
+
+def create_holding(code, name, entry_price, quantity, entry_date, initial_stop, identifier=None):
+    code, name = str(code).strip(), str(name).strip()
+    if len(code) != 6 or not code.isascii() or not code.isdigit():
+        raise ValueError('종목 코드는 6자리 숫자여야 합니다.')
+    if not name or len(name) > 100:
+        raise ValueError('종목명을 확인하세요.')
+    entry = positive_record_number(entry_price, '실제 매수가')
+    stop = positive_record_number(initial_stop, '최초 손절가')
+    quantity = positive_record_number(quantity, '최초 매수 수량', whole=True)
+    if stop >= entry:
+        raise ValueError('최초 손절가는 실제 매수가보다 낮아야 합니다.')
+    identifier = uuid.uuid4().hex if identifier is None else identifier
+    if not isinstance(identifier, str) or not identifier or len(identifier) > 100 or not all(c.isalnum() or c in '-_' for c in identifier):
+        raise ValueError('보유 기록 식별자가 올바르지 않습니다.')
+    return {'id': identifier, 'code': code, 'name': name, 'entry_price': entry,
+            'quantity': quantity, 'entry_date': validate_record_date(entry_date),
+            'initial_stop': stop, 'fills': [], 'stop_updates': []}
+
+
+def holding_balance(position):
+    return position['quantity'] - sum(fill['quantity'] for fill in position['fills'])
+
+
+def record_holding_sale(position, quantity, price, date, kind='기타', identifier=None):
+    quantity = positive_record_number(quantity, '매도 수량', whole=True)
+    price = positive_record_number(price, '실제 매도가')
+    date = validate_record_date(date)
+    if kind not in {'1차 익절', '2차 익절', '전량 청산', '기타'}:
+        raise ValueError('매도 구분이 올바르지 않습니다.')
+    if date < position['entry_date'] or (position['fills'] and date < position['fills'][-1]['date']):
+        raise ValueError('매도 체결은 매수일 이후 날짜순으로 등록하세요.')
+    if quantity > holding_balance(position):
+        raise ValueError('잔여 수량보다 많이 매도할 수 없습니다.')
+    if kind == '전량 청산' and quantity != holding_balance(position):
+        raise ValueError('전량 청산 수량은 잔여 수량과 같아야 합니다.')
+    if '익절' in kind and price <= position['entry_price']:
+        raise ValueError('익절 체결 가격은 매수가보다 높아야 합니다. 손실 매도는 기타·전량 청산으로 기록하세요.')
+    first, _ = partial_exit_quantities(position['quantity'])
+    first_sold = sum(f['quantity'] for f in position['fills'] if f['kind'] == '1차 익절')
+    if kind == '2차 익절' and first_sold < first:
+        raise ValueError('1차 익절 체결을 먼저 기록하세요.')
+    identifier = uuid.uuid4().hex if identifier is None else identifier
+    if not isinstance(identifier, str) or not identifier or len(identifier) > 100 or identifier in {f['id'] for f in position['fills']}:
+        raise ValueError('체결 기록 식별자가 중복되거나 올바르지 않습니다.')
+    result = dict(position, fills=list(position['fills']))
+    result['fills'].append({'id': identifier, 'quantity': quantity, 'price': price, 'date': date, 'kind': kind})
+    return result
+
+
+def record_holding_stop(position, price, date):
+    price = positive_record_number(price, '변경 손절가')
+    date = validate_record_date(date)
+    last_stop = position['stop_updates'][-1]['price'] if position['stop_updates'] else position['initial_stop']
+    if price < last_stop or date < position['entry_date'] or (position['stop_updates'] and date < position['stop_updates'][-1]['date']):
+        raise ValueError('손절가는 낮출 수 없으며 변경 내역은 날짜순으로 등록하세요.')
+    if not holding_balance(position):
+        raise ValueError('청산 완료된 보유분의 손절가는 변경할 수 없습니다.')
+    return dict(position, stop_updates=position['stop_updates'] + [{'date': date, 'price': price}])
+
+
+def registered_holding_risk(book):
+    return sum(holding_balance(p) * expected_stop_risk(
+        p['entry_price'], p['stop_updates'][-1]['price'] if p['stop_updates'] else p['initial_stop']) for p in book)
+
+
+def holding_guidance(position, history):
+    """Advice from confirmed daily bars and actual fills; never changes the ledger."""
+    remaining = holding_balance(position)
+    result = {'action': 'DATA', 'label': '시세 확인 필요', 'reason': '확정 시세를 조회하세요.',
+              'remaining': remaining, 'sell_quantity': 0}
+    proceeds = sum(f['quantity'] * f['price'] * .998 for f in position['fills'])
+    sold = position['quantity'] - remaining
+    result['realized_pnl'] = round(proceeds - sold * position['entry_price'] * 1.0005)
+    if remaining == 0:
+        return dict(result, action='CLOSED', label='청산 완료', reason='등록된 실제 매도 내역으로 잔여 수량이 0주입니다.')
+    if not valid_price_history(history, min_rows=20):
+        return result
+    asof = history.index[-1]
+    if (market_today() - asof.date()).days not in range(8):
+        return dict(result, reason='시세가 미래 날짜이거나 7일을 초과했습니다.')
+    event_dates = [position['entry_date']] + [f['date'] for f in position['fills']] + [u['date'] for u in position['stop_updates']]
+    if asof.date().isoformat() < max(event_dates):
+        return dict(result, reason='최근 체결·손절 변경 이후의 확정 일봉이 아직 없습니다. 장중 가격은 증권사에서 확인하세요.')
+    entry_date = pd.Timestamp(position['entry_date'])
+    if entry_date not in history.index:
+        return dict(result, reason='매수일의 거래 데이터를 찾지 못했습니다. 날짜와 조회 기간을 확인하세요.')
+    entry, stop = position['entry_price'], position['initial_stop']
+    registered_stop = position['stop_updates'][-1]['price'] if position['stop_updates'] else stop
+    stop_date = position['stop_updates'][-1]['date'] if position['stop_updates'] else position['entry_date']
+    first_qty, second_qty = partial_exit_quantities(position['quantity'])
+    first_sold = sum(f['quantity'] for f in position['fills'] if f['kind'] == '1차 익절')
+    second_sold = sum(f['quantity'] for f in position['fills'] if f['kind'] == '2차 익절')
+    first_done, second_done = first_sold >= first_qty, second_qty > 0 and second_sold >= second_qty
+    targets = exit_targets(entry, stop)
+    before_entry = history.loc[history.index < entry_date]
+    atr = calculate_wilder_atr(before_entry) if len(before_entry) >= 15 else 0
+    after_entry = history.loc[history.index > entry_date]
+    peak = max([entry] + [f['price'] for f in position['fills']]
+               + ([float(after_entry.High.max())] if not after_entry.empty else []))
+    suggested_stop = protection_stop(entry, targets[0] - entry, registered_stop, peak, atr, first_done, second_done)
+    bar = history.iloc[-1]
+    close = float(bar.Close)
+    days = len(history.loc[history.index >= entry_date])
+    result.update(asof=asof.strftime('%Y-%m-%d'), close=close, stop=registered_stop,
+                  suggested_stop=suggested_stop, targets=targets, days=days, atr=atr,
+                  pnl_pct=round((close / entry - 1) * 100, 2),
+                  unrealized_pnl=round(remaining * (close * .998 - entry * 1.0005)))
+    if close <= registered_stop:
+        return dict(result, action='EXIT', label='손절 우선', sell_quantity=remaining,
+                    reason='확정 종가가 등록 손절선 이하입니다. 실제 잔여 수량을 확인하고 청산을 우선 검토하세요.')
+    if str(asof.date()) > stop_date and float(bar.Low) <= registered_stop:
+        return dict(result, action='REVIEW', label='손절선 도달 · 체결 확인', sell_quantity=remaining,
+                    reason='해당 일봉의 저가가 등록 손절선에 도달했습니다. 이미 매도됐는지 확인하고 미체결 잔여분의 청산을 검토하세요.')
+    if close >= targets[2]:
+        return dict(result, action='EXIT', label='3차 목표 · 전량 청산 검토', sell_quantity=remaining,
+                    reason='확정 종가가 실제 매수가 기준 +3R 목표 이상입니다.')
+    closing_reason = closing_exit_reason(close, float(history.Close.tail(5).mean()), float(history.Low.iloc[-2]), days, first_done)
+    if closing_reason:
+        return dict(result, action='EXIT', label='추세 이탈 · 청산 검토' if closing_reason == 'TREND_BREAK_EXIT' else '보유 기한 · 청산 검토',
+                    sell_quantity=remaining, reason='익절 후 단기 추세가 이탈했습니다.' if closing_reason == 'TREND_BREAK_EXIT' else '최대 보유 10거래일에 도달했습니다.')
+    if not first_done and close >= targets[0]:
+        return dict(result, action='PARTIAL', label='1차 부분 익절 검토', kind='1차 익절',
+                    sell_quantity=min(remaining, first_qty - first_sold), reason='실제 매수가 기준 +1R 이상입니다. 최초 수량의 30%에 해당하는 미체결분을 확인하세요.')
+    if first_done and not second_done and second_qty > 0 and close >= targets[1]:
+        return dict(result, action='PARTIAL', label='2차 부분 익절 검토', kind='2차 익절',
+                    sell_quantity=min(remaining, second_qty - second_sold), reason='실제 매수가 기준 +2R 이상입니다. 최초 수량의 40%에 해당하는 미체결분을 확인하세요.')
+    if suggested_stop >= close:
+        return dict(result, action='EXIT', label='보호선 이탈 · 청산 검토', sell_quantity=remaining,
+                    reason='확정 종가가 익절 후 권장 보호선 이하입니다. 등록 손절선을 낮추지 말고 잔여분 청산을 검토하세요.')
+    return dict(result, action='HOLD', label='보유 유지',
+                reason='등록 손절선과 다음 익절 목표를 확인하세요.' if atr > 0 else '보유 유지. 매수 전 ATR 자료가 부족해 추가 추적 보호선 산출은 보류합니다.')
+
+
+def export_holding_book(book):
+    return json.dumps({'version': 1, 'positions': book}, ensure_ascii=False, allow_nan=False, indent=2).encode('utf-8')
+
+
+def import_holding_book(payload):
+    if len(payload) > 1024 * 1024:
+        raise ValueError('백업 파일은 1MB 이하여야 합니다.')
+    try:
+        root = json.loads(payload)
+    except (ValueError, TypeError, UnicodeDecodeError):
+        raise ValueError('올바른 JSON 백업 파일이 아닙니다.')
+    if not isinstance(root, dict) or type(root.get('version')) is not int or root['version'] != 1 or not isinstance(root.get('positions'), list) or len(root['positions']) > 500:
+        raise ValueError('지원하지 않는 보유 내역 백업 형식입니다.')
+    result, identifiers = [], set()
+    try:
+        for item in root['positions']:
+            if not isinstance(item, dict) or not isinstance(item.get('fills'), list) or not isinstance(item.get('stop_updates'), list):
+                raise ValueError('보유·체결 내역 형식이 올바르지 않습니다.')
+            if not isinstance(item.get('id'), str) or not item['id']:
+                raise ValueError('보유 기록 식별자가 올바르지 않습니다.')
+            p = create_holding(item['code'], item['name'], item['entry_price'], item['quantity'], item['entry_date'], item['initial_stop'], item['id'])
+            if p['id'] in identifiers:
+                raise ValueError('보유 기록 식별자가 중복됩니다.')
+            identifiers.add(p['id'])
+            for update in item['stop_updates']:
+                p = record_holding_stop(p, update['price'], update['date'])
+            for fill in item['fills']:
+                if not isinstance(fill.get('id'), str) or not fill['id']:
+                    raise ValueError('체결 기록 식별자가 올바르지 않습니다.')
+                p = record_holding_sale(p, fill['quantity'], fill['price'], fill['date'], fill['kind'], fill['id'])
+            if not holding_balance(p) and any(u['date'] > p['fills'][-1]['date'] for u in p['stop_updates']):
+                raise ValueError('청산 이후 손절가 변경 기록이 있습니다.')
+            result.append(p)
+    except (KeyError, TypeError, AttributeError) as error:
+        raise ValueError('백업의 필수 항목이 누락되거나 올바르지 않습니다.') from error
+    return result
+
+
+def merge_holding_books(existing, incoming):
+    merged = {p['id']: p for p in existing}
+    for p in incoming:
+        if p['id'] in merged and merged[p['id']] != p:
+            raise ValueError('같은 기록에 서로 다른 내역이 있습니다. 교체 복원을 선택하거나 올바른 백업을 사용하세요.')
+        merged[p['id']] = p
+    return list(merged.values())
+
+
 def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_holding=10, sell_fee=0.0020,
                               market_slippage=0.0010, limit_slippage=0.0005, execution_mode="CONSERVATIVE", trail_atr_mult=1.5):
     b_open = float(bar['Open'])
@@ -997,7 +1227,7 @@ def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_hol
         # 3. T1 도달 (30%)
         if not pos["t1_hit"] and b_high >= pos["t1"]:
             pos["t1_hit"] = True
-            s_qty = min(int(pos["orig_shares"] * 0.30), cur_shares)
+            s_qty = min(partial_exit_quantities(pos["orig_shares"])[0], cur_shares)
             t1_exec_p = floor_to_tick(pos["t1"] * (1.0 - limit_slippage))
             gain = s_qty * t1_exec_p * (1.0 - sell_fee)
             cash_gain_today += gain
@@ -1005,6 +1235,8 @@ def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_hol
             pos["shares"] -= s_qty
             cur_shares = pos["shares"]
             pos["current_stop"] = max(pos["current_stop"], e_price)
+            if cur_shares == 0:
+                exit_event, exit_price = 'TARGET_1R_FULL', t1_exec_p
 
             if b_low <= e_price and cur_shares > 0:
                 is_ambiguous = True
@@ -1018,25 +1250,26 @@ def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_hol
         if exit_event is None and pos["t1_hit"] and not pos["t2_hit"]:
             r1 = pos["t1"] - e_price
             if b_high >= e_price + (1.5 * r1):
-                pos["current_stop"] = max(pos["current_stop"], floor_to_tick(e_price + 0.5 * r1))
+                pos["current_stop"] = protection_stop(e_price, r1, pos["current_stop"], pos["peak_price"], pos["atr"], True, False, trail_atr_mult)
 
         # 5. T2 도달 (40%) & +1.0R 보호 스탑 상향
         if exit_event is None and not pos["t2_hit"] and b_high >= pos["t2"]:
             pos["t2_hit"] = True
-            s_qty = min(int(pos["orig_shares"] * 0.40), pos["shares"])
+            s_qty = min(partial_exit_quantities(pos["orig_shares"])[1], pos["shares"])
             t2_exec_p = floor_to_tick(pos["t2"] * (1.0 - limit_slippage))
             gain = s_qty * t2_exec_p * (1.0 - sell_fee)
             cash_gain_today += gain
             pos["cash_inflow"] += gain
             pos["shares"] -= s_qty
             cur_shares = pos["shares"]
+            if cur_shares == 0:
+                exit_event, exit_price = 'TARGET_2R_FULL', t2_exec_p
             r1 = pos["t1"] - e_price
             pos["current_stop"] = max(pos["current_stop"], floor_to_tick(e_price + 1.0 * r1))
 
         # 6. T2 달성 후 고점 대비 trail_atr_mult ATR 다이내믹 트레일링
         if exit_event is None and pos["t2_hit"]:
-            dynamic_trail = floor_to_tick(pos["peak_price"] - (trail_atr_mult * pos["atr"]))
-            pos["current_stop"] = max(pos["current_stop"], dynamic_trail)
+            pos["current_stop"] = protection_stop(e_price, pos['t1'] - e_price, pos["current_stop"], pos["peak_price"], pos["atr"], True, True, trail_atr_mult)
 
         # 7. T3 도달 (잔여 전량)
         if exit_event is None and b_high >= pos["t3"]:
@@ -1045,13 +1278,10 @@ def process_intraday_position(pos, bar, ma5_val, prev_low, cur_date_str, max_hol
             exit_price = floor_to_tick(pos["t3"] * (1.0 - limit_slippage))
         # 8. Closing exits occur after intraday target fills. Existing gap/stop
         # priorities and the execution-mode ambiguity assumptions stay in force.
-        elif exit_event is None and pos["t1_hit"] and b_close < ma5_val and b_close < prev_low:
-            exit_event = "TREND_BREAK_EXIT"
-            exit_price = floor_to_tick(b_close * (1.0 - market_slippage))
-        # 9. Time Stop
-        elif exit_event is None and h_days >= max_holding:
-            exit_event = "TIME_STOP"
-            exit_price = floor_to_tick(b_close * (1.0 - market_slippage))
+        elif exit_event is None:
+            exit_event = closing_exit_reason(b_close, ma5_val, prev_low, h_days, pos['t1_hit'], max_holding)
+            if exit_event:
+                exit_price = floor_to_tick(b_close * (1.0 - market_slippage))
 
     pos["ambiguous_seen"] = pos.get("ambiguous_seen", False) or is_ambiguous
     if exit_event is not None:
@@ -1681,161 +1911,22 @@ def transfer_scanned_stock():
     st.session_state['selected_stock'] = selected
     for key in ('diagnosis_stock', 'backtest_stock', 'stress_stock'):
         st.session_state[key] = selected
+    st.session_state['open_trade_plan'] = True
 
 
-st.sidebar.button('시세·시장 데이터 새로 조회', on_click=refresh_market_data)
+def render_buy_candidates(dual_regime):
+    st.subheader("오늘의 매수 후보")
+    st.caption('지지·반등 조건을 통과한 상위 후보입니다. 진입 가격과 손실 한도는 아래 매매 계획에서 확인하세요.')
 
-dual_regime = get_current_dual_regime()
-
-st.title("⚖️ QUANT-EXECUTION ENGINE PRO MAX")
-st.caption('전략 버전: SUPPORT-REBOUND-1 · MA20 지지·반등 확인 후 다음 거래일 조건부 진입')
-st.caption("“주가를 예측하지 않고, **틀렸을 때 손실을 제한하고 맞았을 때 분할 익절**하도록 통제하는 기계적 실행 시스템”")
-
-c_rg1, c_rg2 = st.columns([1, 3])
-with c_rg1:
-    st.metric("최근 데이터 기준 듀얼 시장 국면", dual_regime["status"], f"배분 배수: {dual_regime['multiplier']}x")
-with c_rg2:
-    (st.warning if dual_regime["code"] == "UNKNOWN" else st.info)(f"💡 **시장 대응 지침**: {dual_regime['msg']}")
-st.caption(f"시장 데이터 기준일: {dual_regime.get('data_date') or '확인 불가'} · 시세 조회 캐시 최대 1시간. 장중 데이터는 미완성 일봉일 수 있습니다.")
-
-if "selected_stock" not in st.session_state:
-    st.session_state["selected_stock"] = "삼성전자"
-for stock_key in ('diagnosis_stock', 'backtest_stock', 'stress_stock'):
-    st.session_state.setdefault(stock_key, st.session_state['selected_stock'])
-
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "🎯 STEP 1 · 실행 중심 퀀트 진단 & 포지션 계산",
-    "📡 STEP 2 · 코스피 Buy Zone 스크리너",
-    "🧪 STEP 3 · 단일 종목 실계좌 MTM 백테스트",
-    "💼 STEP 4 · 다종목 포트폴리오 시뮬레이터",
-    "🔬 STEP 5 · 3D Walk-Forward(WFO) & 스트레스 테스트",
-    "📘 주린이 눈높이 실전 매뉴얼",
-    "📖 시스템 무결성 헌장"
-])
-
-# -------------------------------------------------------------
-# TAB 1: 퀀트 진단 & 포지션 계산
-# -------------------------------------------------------------
-with tab1:
-    st.subheader("정밀 실행 계획 & 리스크 기반 포지션 산출")
-
-    with st.expander("💡 [주린이 30초 요약] 이 화면을 어떻게 읽고 행동해야 하나요? (클릭하여 열기)"):
-        st.markdown("""
-        * **1. 최종 판정 확인**: **조건부 진입**일 때만 다음 거래일 트리거 주문을 검토합니다. 관찰·시장 차단 상태에서는 주문하지 않습니다.
-        * **2. 가격 4총사 메모**: HTS/MTS를 켜고 **동적 손절선**과 **1차 목표가(+1R)**를 먼저 입력합니다.
-        * **3. 딱 '권장 매수 수량'만큼만 주문**: 내 원금 전체를 몰빵하지 말고, 시스템이 설정 손실률과 거래비용으로 정해준 주수만큼만 삽니다.
-        * **4. 체결 즉시 스탑로스 설정**: 주식을 사자마자 증권사 앱에서 **손절가에 '자동 감시 매도'**를 걸어둡니다.
-        """)
-
-    col1, col2, col3 = st.columns([2, 1.5, 1])
-    with col1:
-        target_stock = st.text_input("종목명 또는 6자리 코드", key="diagnosis_stock")
-    with col2:
-        acc_cap = st.number_input("내 총 계좌 잔고 (원)", min_value=1000000, value=30000000, step=5000000)
-    with col3:
-        risk_pct_input = st.slider("1회 허용 손실률 (%)", 0.3, 2.0, 1.0, step=0.1)
-
-    with st.expander('기존 보유분을 포함한 계좌 손절 위험 예산'):
-        live_total_risk_pct = st.number_input('진단 계좌 전체 위험 한도 (%)', min_value=0.5, max_value=10.0, value=3.0, step=0.5)
-        existing_stop_risk = st.number_input('기존 보유분의 예상 손절 위험 (원)', min_value=0, value=0, step=10000)
-        st.caption('증권 계좌를 자동 조회하지 않습니다. 기존 보유가 있으면 거래비용을 포함한 예상 손절 손실 합계를 입력하세요. 섹터·상관 위험 한도는 STEP 4 모의 포트폴리오에 적용됩니다.')
-
-    if st.button("실행 계획 정밀 진단", type="primary"):
-        with st.spinner("호가 검증 및 100점 파이프라인 연산 중..."):
-            df_krx = load_krx_listing()
-            code, name = find_stock_code(target_stock, df_krx)
-
-            if not code:
-                st.error("종목을 찾을 수 없습니다.")
-            else:
-                s_date = (market_today() - datetime.timedelta(days=350)).strftime("%Y-%m-%d")
-                df_p = completed_live_history(load_price_history(code, s_date))
-                df_ks = load_price_history('KS11', s_date)
-
-                sec_name = get_sector_for_stock(code, df_krx)
-                sec_df = load_sector_etf_series(sec_name, s_date)
-
-                if df_p is None or len(df_p) < 61:
-                    st.error("지지·반등 진단에 필요한 최소 61거래일의 시세가 부족합니다.")
-                else:
-                    supply = get_supply_data(code, df_p.index[-1])
-                    if supply["status"] != "OK":
-                        st.caption("외국인 수급을 확인하지 못해 수급 가점을 적용하지 않습니다.")
-                    verdict, df_p = evaluate_live_execution(
-                        df_p, dual_regime, df_ks, sec_df,
-                        has_frgn=(supply["status"] == "OK" and supply["frgn_5"] is not None and supply["frgn_5"] > 0)
-                    )
-                    pattern = verdict['pattern']
-                    st.markdown(f"**패턴 상태: {pattern['label']}**")
-                    st.caption(pattern['reason'])
-                    if verdict['scored']['grade'] == 'UNVERIFIED':
-                        st.warning(verdict['reason'])
-                    else:
-                        st.caption(f"종목 데이터 기준일: {df_p.index[-1].strftime('%Y-%m-%d')}")
-                    if verdict['scored']['grade'] != 'UNVERIFIED':
-                        levels = verdict["levels"]
-                        scored = verdict["scored"]
-                        curr_price = pattern.get('max_entry_price', levels['entry_price'])
-
-                        clean_amt = get_clean_avg_amount(df_p, 20)
-                        pos = calculate_position_sizing(
-                            acc_cap, risk_pct_input, verdict["multiplier"],
-                            curr_price, curr_price - levels["stop_price"], levels["atr14"], clean_amt,
-                            remaining_account_risk=max(0, acc_cap * live_total_risk_pct / 100 - existing_stop_risk)
-                        )
-
-                        st.markdown("---")
-                        if "BUY" in verdict["action"] and pos['shares'] == 0:
-                            st.warning('종목 조건을 통과했지만 위험 예산·비중·유동성 한도로 매수 가능한 수량이 0주입니다.')
-                        elif "BUY" in verdict["action"]:
-                            st.success(f"### {verdict['badge']}\n**진입 전략 트랙**: `{scored['track']}` | **업종 매핑**: `{sec_name}` | **지침**: {verdict['reason']}")
-                        elif verdict["action"] == "WAIT":
-                            st.warning(f"### {verdict['badge']}\n**업종 매핑**: `{sec_name}` | **지침**: {verdict['reason']}")
-                        else:
-                            st.error(f"### {verdict['badge']}\n**지침**: {verdict['reason']}")
-
-                        st.markdown("#### 💯 100점 만점 퀀트 평가 내역 (전 종목 Sector RS 자동 결합)")
-                        dt_cols = st.columns(6)
-                        for i, (k, v) in enumerate(scored["details"].items()):
-                            dt_cols[i].metric(k, v)
-
-                        if levels["resistance_warning"]:
-                            st.warning(f"⚠️ **저항선 주의**: {levels['resistance_warning']}")
-
-                        if pattern['state'] == 'CONFIRMED':
-                            st.markdown("### 🛑 다음 거래일 조건부 진입 계획")
-                            st.caption(f"트리거 {pattern['trigger_price']:,}원 · 최대 진입가 {pattern['max_entry_price']:,}원 · "
-                                       f"지지 무효화 {pattern['invalidation_price']:,}원. 다음 거래일 미돌파·무효화·최대가 초과 시 취소합니다.")
-                            st.caption('가격선은 트리거 체결을 가정합니다. 수량은 최대 진입가와 표시 손절가 기준으로 보수적으로 산정하며, 실제 체결 후 손절·목표가·수량을 다시 계산해야 합니다. 예상 거래비용을 포함합니다.')
-                            m1, m2, m3, m4 = st.columns(4)
-                            m1.metric("조건부 진입 트리거", f"{levels['entry_price']:,}원", f"Wilder ATR: {levels['atr14']:,.2f}원")
-                            m2.metric("동적 손절선 (보수적)", f"{levels['stop_price']:,}원", f"{levels['loss_pct']}%", delta_color="inverse")
-                            m3.metric("1차 익절가 (30% 매도 & 본전스탑)", f"{levels['target_1r']:,}원", "+1.0R")
-                            m4.metric("2차 익절가 (40% 매도)", f"{levels['target_2r']:,}원", "+2.0R")
-
-                            st.markdown("### 💼 계좌 리스크 기반 포지션 및 2-Track 손실 시뮬레이션")
-                            p1, p2, p3, p4 = st.columns(4)
-                            p1.metric("최종 권장 매수 수량", f"{pos['shares']:,}주", f"계좌 비중: {pos['weight_pct']}%")
-                            p2.metric("수량 제한 요인", pos["limiting_factor"], f"실질 리스크: {pos['real_risk_pct']}%")
-                            p3.metric("비용 포함 예상 손절 손실", f"-{pos['normal_risk_loss']:,}원", "1R 원칙 통제")
-                            p4.metric("스트레스 갭다운(-1ATR)", f"-{pos['worst_gap_loss']:,}원", "오버나이트 급락 가정", delta_color="inverse")
-
-# -------------------------------------------------------------
-# TAB 2: 코스피 Buy Zone 스크리너 (수급 정합성 옵션 추가)
-# -------------------------------------------------------------
-with tab2:
-    st.subheader("코스피 Buy Zone 지지 및 반등 트리거 탐색기")
-    st.caption('각 봉 직전 확정 MA20·ATR로 최근 3개 봉의 지지 시험과 회복을 확인합니다. 반등 확인·70점·시장·손절폭 조건을 통과하면 다음 거래일 고가 돌파를 기다립니다. 관찰 후보는 매수 추천이 아닙니다.')
-    st.caption('당일 봉은 15:40 KST 이후 조회된 시세부터 사용합니다. 업종은 키워드 기반 추정이며 미분류는 대표지수 ETF를 사용합니다.')
-
-    c_s1, c_s2, c_s3 = st.columns([1.5, 1.5, 1])
-    with c_s1:
-        min_cap = st.number_input("시가총액 하한 (억원)", 500, 20000, 2000, step=500)
-    with c_s2:
-        scan_pool = st.slider("스캔 풀 (거래대금 상위)", 50, 300, 100, step=50)
-    with c_s3:
-        include_supply_in_scan = st.checkbox("외국인 수급 5점 결합 (정밀 스캔)", value=False,
-                                             help='수급 가점은 패턴 확인·시장 차단·진입 무효화 조건을 대체하지 않습니다.')
+    with st.expander('검색 조건 조정'):
+        c_s1, c_s2, c_s3 = st.columns([1.5, 1.5, 1])
+        with c_s1:
+            min_cap = st.number_input("시가총액 하한 (억원)", 500, 20000, 2000, step=500)
+        with c_s2:
+            scan_pool = st.slider("스캔 풀 (거래대금 상위)", 50, 300, 100, step=50)
+        with c_s3:
+            include_supply_in_scan = st.checkbox("외국인 수급 5점 결합 (정밀 스캔)", value=False,
+                                                 help='수급 가점은 패턴 확인·시장 차단·진입 무효화 조건을 대체하지 않습니다.')
 
     scan_context = scan_result_context(dual_regime, min_cap, scan_pool, include_supply_in_scan)
     if "screened_res" in st.session_state and not scan_results_are_current(
@@ -1845,7 +1936,7 @@ with tab2:
     if dual_regime['code'] in {'RISK-OFF', 'UNKNOWN'}:
         st.warning('현재 시장 국면으로 신규 진입을 차단합니다. 스캔은 지지·반등 관찰 후보를 계속 보여줍니다.')
 
-    if st.button("Buy Zone 종목 스캔 시작", type="primary"):
+    if st.button("매수 후보 찾기", type="primary"):
         invalidate_scan_results()
         with st.spinner('지지·회복·반등 상태와 조건부 진입 요건을 검증 중...'):
             df_k = load_stock_listing('KOSPI')
@@ -1958,22 +2049,31 @@ with tab2:
     if 'screened_res' in st.session_state and not st.session_state['screened_res'].empty:
         st.markdown('#### 조건부 진입 후보 · 다음 거래일 트리거 대기')
         df_show = st.session_state['screened_res'].sort_values('스코어', ascending=False) if '스코어' in st.session_state['screened_res'] else st.session_state['screened_res']
-        st.dataframe(df_show, width='stretch')
+        st.dataframe(df_show.head(5)[[c for c in ['종목명', '현재가', '스코어', '진입트리거', '손절가', '최종판정'] if c in df_show]], width='stretch')
+        if len(df_show) > 5:
+            with st.expander(f'나머지 조건부 후보 {len(df_show)-5}개'):
+                st.dataframe(df_show.iloc[5:], width='stretch')
+        with st.expander('후보 상세 수치'):
+            st.dataframe(df_show, width='stretch')
         candidates.extend(df_show['종목명'].tolist())
     if 'screened_watch' in st.session_state and not st.session_state['screened_watch'].empty:
         st.markdown('#### 관찰 후보 · 현재 신규 진입 보류')
         df_watch = st.session_state['screened_watch'].sort_values('스코어', ascending=False, na_position='last')
-        st.dataframe(df_watch, width='stretch')
+        st.dataframe(df_watch.head(5)[[c for c in ['종목명', '현재가', '패턴상태', '보류·진입 근거'] if c in df_watch]], width='stretch')
+        if len(df_watch) > 5:
+            with st.expander(f'나머지 관찰 후보 {len(df_watch)-5}개'):
+                st.dataframe(df_watch.iloc[5:], width='stretch')
         candidates.extend(df_watch['종목명'].tolist())
     if candidates:
-        st.selectbox('진단 탭으로 전송할 종목 선택', list(dict.fromkeys(candidates)), key='scan_stock_choice')
-        if st.button('선택 종목을 STEP 1으로 전송', on_click=transfer_scanned_stock):
-            st.info(f"'{st.session_state['selected_stock']}' 선택 완료. 진단·백테스트·스트레스 검증 탭에 반영했습니다.")
+        st.selectbox('매매 계획을 확인할 종목', list(dict.fromkeys(candidates)), key='scan_stock_choice')
+        if st.button('이 종목의 매매 계획 보기', on_click=transfer_scanned_stock):
+            st.caption('선택한 종목의 매매 계획을 아래에 표시합니다.')
 
 # -------------------------------------------------------------
 # TAB 3: 단일 종목 실계좌 MTM 백테스트 & 3-모드 삼각비교
-# -------------------------------------------------------------
-with tab3:
+
+
+def render_single_analysis():
     st.subheader("단일 종목 일별 시가평가(Daily MTM) 모의 백테스트")
     st.caption("일봉 체결 후 고저 순서는 알 수 없어 체결 모드별 가정을 적용합니다. REBOUND 조건부 진입, 부분익절 누적 현금흐름 완결 회계, 과거 5일 외국인 수급 및 전 종목 자동 Sector RS를 동시 반영합니다.")
 
@@ -2054,8 +2154,9 @@ with tab3:
 
 # -------------------------------------------------------------
 # TAB 4: 다종목 포트폴리오 시뮬레이터 (전 종목 수급·섹터·트레일 완전 일치)
-# -------------------------------------------------------------
-with tab4:
+
+
+def render_portfolio_analysis():
     st.subheader("다종목 동시 보유 포트폴리오 시뮬레이터 (Portfolio MTM)")
     st.caption("외국인 수급은 조회 가능한 과거 구간에서만 반영합니다. 섹터는 현재 업종 기준 추정이며 과거 업종 변경은 반영하지 않습니다. 전체 계좌 자산 기준 리스크 사이징, 종목별 과거 수급 5일 합계 및 전 종목 자동 Sector RS·다이내믹 Trailing을 완전 일치 검증합니다.")
 
@@ -2112,8 +2213,9 @@ with tab4:
 
 # -------------------------------------------------------------
 # TAB 5: 진성 3D Walk-Forward WFO & 슬리피지 스트레스 테스트
-# -------------------------------------------------------------
-with tab5:
+
+
+def render_wfo_analysis():
     st.subheader("🔬 진성 3D Walk-Forward Optimization (WFO) & 슬리피지 부하 검증")
     st.caption("IS에서 [Score x Trail x Hold] 27개 조합을 탐색하고 OOS에서 고정 평가합니다. 60거래일 워밍업과 일별 복리 수익률 기준 WFE를 사용합니다. IS 최소 20건·OOS 최소 10건의 청산 거래가 필요합니다.")
 
@@ -2160,101 +2262,254 @@ with tab5:
 
 # -------------------------------------------------------------
 # TAB 6: 주린이 눈높이 실전 매뉴얼
-# -------------------------------------------------------------
-with tab6:
-    st.subheader("📘 주린이 전용 실전 매뉴얼: 이 화면을 어떻게 읽고 행동할까?")
-    st.caption("주가를 예측하지 않고, **언제 사고 / 어디서 도망치고 / 어디서 돈을 챙길지** 통제하는 자동 안전벨트 설명서입니다.")
 
-    st.markdown(r"""
-    ---
-    ### 1. 장 시작 전 필수 확인: 시장 신호등 (Market Regime)
-    화면 맨 위에 항상 떠 있는 배너는 **“지금 주식을 새로 사도 되는 날씨인가?”**를 알려주는 신호등입니다.
 
-    | 신호등 상태 | 시장 상태 설명 | 내가 취해야 할 행동 |
-    |---|---|---|
-    | **🟢 FAVORABLE (우호)** | 코스피/코스닥 둘 다 20일선 위에서 상승 중 | 추천된 권장 수량(100%) 매수 가능 |
-    | **🟡 NEUTRAL (중립/경계)** | 지수 하나가 흔들리거나 횡보 중 | 권장 매수 수량의 **절반(50%)만 매수** |
-    | **⚪ UNKNOWN (미확인)** | 필수 시장 데이터가 없거나 오래됨 | 신규 매수 보류 |
-    | **🔴 RISK-OFF (위험 회피)** | 주요 지수가 20일선 아래로 꺾인 하락장 | **신규 매수 전면 금지** (100점이어도 절대 매수 금지) |
+def prefill_holding_entry(code, name, price, quantity, stop):
+    st.session_state.update(main_view='내 보유종목 관리', holding_symbol=code,
+                            holding_name=name, holding_entry_price=float(price),
+                            holding_quantity=max(1, int(quantity)), holding_initial_stop=float(stop),
+                            holding_entry_date=market_today(), open_holding_form=True)
 
-    ---
-    ### 2. STEP 1 진단 결과: 가격 4총사와 주문 수량 해석법
 
-    #### ① 진입 전략 트랙 (어떻게 살 것인가?)
-    * **REBOUND (지지 회복 후 돌파 대기)**: 전일 MA20 지지 구간의 최근 3개 봉 시험, 종가 회복, 양봉·전일 대비 상승·종가 위치·거래량을 확인합니다.
-    * **조건부 진입 후보**: 반등 확인과 70점·시장·손절폭 조건을 통과한 상태입니다. 다음 거래일 반등 봉 고가 위 트리거를 돌파할 때만 진입합니다.
-    * **관찰 후보**: 지지 접근·회복 대기 또는 시장·점수·손절폭으로 진입을 보류한 상태입니다. 관찰 표에 있다는 이유로 매수하지 않습니다.
-    * **주문 취소**: 다음 거래일 미돌파, 지지 무효화 가격 침범, 최대 진입가 초과 시 취소하고 종가 후 다시 진단합니다. 지지 이탈과 돌파가 함께 있는 일봉은 시가에서 이미 체결된 경우 외에는 보수적으로 진입하지 않습니다.
-    * **확정 일봉**: 당일 봉은 15:40 KST 이후 실제 조회된 데이터부터 사용합니다. 장중에 캐시된 봉은 시간이 지났다는 이유로 확정 봉으로 바꾸지 않습니다.
+def render_trade_plan(dual_regime, acc_cap, risk_pct_input, live_total_risk_pct, existing_stop_risk):
+    st.subheader('선택 종목의 매매 계획')
+    target_stock = st.text_input('종목명 또는 6자리 코드', key='diagnosis_stock')
+    requested = st.button('매매 계획 확인', type='primary')
+    if requested or st.session_state.pop('open_trade_plan', False):
+        st.session_state['active_plan_symbol'] = target_stock
+    if st.session_state.get('active_plan_symbol') != target_stock:
+        st.caption('후보를 선택하거나 종목을 직접 입력하면 진입·익절·손절 계획을 한곳에서 확인할 수 있습니다.')
+        return
+    with st.spinner('진입 조건과 계좌 손실 한도를 확인 중...'):
+        code, name = find_stock_code(target_stock, load_krx_listing())
+        if not code:
+            st.error('종목을 찾지 못했습니다. 6자리 코드를 입력해 다시 확인하세요.')
+            return
+        s_date = (market_today() - datetime.timedelta(days=350)).isoformat()
+        prices = completed_live_history(load_price_history(code, s_date))
+        if not valid_price_history(prices, min_rows=61):
+            st.warning('계획을 만들 최소 61거래일의 확정 시세가 부족합니다.')
+            return
+        market = load_price_history('KS11', s_date)
+        sector_name = get_sector_for_stock(code, load_krx_listing())
+        sector = load_sector_etf_series(sector_name, s_date)
+        supply = get_supply_data(code, prices.index[-1])
+        decision, prices = evaluate_live_execution(prices, dual_regime, market, sector,
+                            supply['status'] == 'OK' and supply['frgn_5'] is not None and supply['frgn_5'] > 0)
+        st.markdown(f'### {name} ({code})')
+        verified = decision['scored']['grade'] != 'UNVERIFIED'
+        if not verified:
+            st.warning(decision['reason'])
+            return
+        pattern, levels = decision['pattern'], decision['levels']
+        sizing_price = pattern.get('max_entry_price', levels['entry_price'])
+        sizing = calculate_position_sizing(acc_cap, risk_pct_input, decision['multiplier'], sizing_price,
+                         sizing_price - levels['stop_price'], levels['atr14'], get_clean_avg_amount(prices, 20),
+                         remaining_account_risk=max(0, acc_cap * live_total_risk_pct / 100 - existing_stop_risk))
+        eligible = decision['action'] in {'BUY', 'BUY_REDUCED'} and sizing['shares'] > 0
+        if eligible:
+            st.success('진입 대기 · 다음 거래일 트리거를 충족할 때만 매수를 검토하세요.')
+        elif decision['action'] == 'AVOID':
+            st.error('시장 상황으로 신규 매수 보류 · ' + decision['reason'])
+        elif decision['action'] in {'BUY', 'BUY_REDUCED'}:
+            st.warning('매수 보류 · 등록 보유분과 계좌 손실 한도를 반영한 주문 가능 수량이 0주입니다.')
+        else:
+            st.info('관찰 · ' + decision['reason'])
+        st.caption(f"기준일 {prices.index[-1]:%Y-%m-%d} · {pattern['label']} · {decision['scored']['score']}점 · {sector_name}")
+        if pattern['state'] == 'CONFIRMED':
+            a, b, c = st.columns(3)
+            a.metric('조건부 진입 트리거', f"{pattern['trigger_price']:,}원")
+            b.metric('매수 상한가', f"{pattern['max_entry_price']:,}원")
+            c.metric('최종 권장 매수 수량', f"{sizing['shares']:,}주")
+            a, b, c = st.columns(3)
+            a.metric('최초 손절가', f"{levels['stop_price']:,}원")
+            b.metric('1차 익절 목표 · 30%', f"{levels['target_1r']:,}원")
+            c.metric('2차 익절 목표 · 40%', f"{levels['target_2r']:,}원")
+            st.caption('다음 거래일 미돌파·지지 무효화·매수 상한가 초과 시 주문을 취소합니다. 목표가는 트리거 체결 가정이며, 수량은 상한가 기준으로 보수적으로 계산합니다.')
+        else:
+            st.caption(pattern['reason'])
+        with st.expander('선정 근거와 손실 예산 상세'):
+            st.write(decision['scored']['details'])
+            st.write(f"등록 보유분·미등록 보유분 손절 위험 합계: {existing_stop_risk:,.0f}원")
+            st.write(f"새 주문의 비용 포함 예상 손절 손실: {sizing['normal_risk_loss']:,}원")
+            st.caption('외국인 수급은 확인된 경우에만 가점에 반영합니다. 가격 목표의 R과 거래비용을 포함한 계좌 위험은 다릅니다.')
+            if levels['resistance_warning']:
+                st.warning(levels['resistance_warning'])
+        st.caption('실제 매수한 뒤 체결 가격·수량·날짜를 등록하면 보유·청산 안내가 이어집니다.')
+        st.button('이 종목의 매수 체결 입력', on_click=prefill_holding_entry,
+                  args=(code, name, levels['entry_price'], max(1, sizing['shares']), levels['stop_price']))
 
-    #### ② 가격 4총사 (내비게이션)
-    ```text
-      [2차 목표가: +2.0R]  ──  최초 수량의 40% 매도 & 트레일링 스탑 가동
-              ▲
-      [1차 목표가: +1.0R]  ──  전체 수량의 30% 확정 매도 & 손절선을 매수가(본전)로 상향
-              ▲
-      [진입 기준가]        ──  내가 실제로 주식을 사야 하는 기준 가격
-              ▼
-      [동적 손절선]        ──  주가가 여기까지 떨어지면 미련 없이 전량 매도 (-1.0R)
-    ```
-    * **동적 손절선**: "내가 틀렸음을 인정하는 가격". 주가가 이 가격을 터치하면 미련 없이 전량 매도하여 큰 손실을 차단합니다.
-    * **1차 목표가 (+1.0R)**: 손절폭만큼 수익이 난 지점. **가지고 있는 주식의 30%를 기계적으로 팔아 수익을 확정**하고, 남은 주식의 손절가를 **내가 산 가격(본전)**으로 수정합니다.
-    * **2차 목표가 (+2.0R)**: 손절폭의 2배 수익이 난 지점. **최초 매수 수량의 40%를 추가 매도**하고, 나머지 30% 잔여분은 고점에서 1.5 ATR 밀릴 때까지 계속 들고 갑니다(트레일링 스탑).
 
-    #### ③ 포지션 사이징: 왜 계좌 돈을 전부 안 쓰고 딱 'OO주'만 사라고 할까?
-    * **1R 원칙**: "한 번의 매매에서 내 계좌 전체 돈의 딱 1%까지만 잃겠다"는 철칙입니다.
-      * 예: 3,000만 원 계좌 $\rightarrow$ 거래비용 포함 계획 손실 예산은 **30만 원** (갭 손실 제외).
-      * 손절폭이 3,000원이면? `30만 원 ÷ (3,000원 + 주당 비용)` 이내 매수.
-      * 손절폭이 6,000원으로 크면? `30만 원 ÷ (6,000원 + 주당 비용)` 이내로 알아서 수량을 절반으로 줄여줍니다.
-    * **수량 제한 요인**:
-      * `RISK_BUDGET`: 설정한 손실 예산과 예상 거래비용에 맞춘 수량.
-      * `WEIGHT_CAP`: 계좌 30% 비중 상한(몰빵 방지).
-      * `LIQUIDITY_CAP`: 거래대금이 적은 종목에 갇히지 않도록 일 거래대금의 1% 이내로 제한.
+def render_holdings(dual_regime):
+    st.subheader('내 보유종목 관리')
+    st.caption('실제 체결 내역으로 잔여 수량을 관리합니다. 안내는 확정 일봉 기준이며, 장중 손절가는 증권사에서 감시하세요.')
+    st.button('보유 시세 새로 확인', on_click=refresh_market_data)
+    notice = st.session_state.pop('holding_notice', None)
+    if notice:
+        st.success(notice)
+    if st.session_state.pop('reset_holding_selection', False):
+        st.session_state.pop('holding_selection', None)
+    book = st.session_state['holding_book']
+    active = [p for p in book if holding_balance(p) > 0]
+    with st.expander('매수 체결 등록', expanded=not book or st.session_state.pop('open_holding_form', False)):
+        st.caption('추천 목록은 체결 내역이 아닙니다. 실제 매수가·최초 수량·매수일·최초 손절가를 입력하세요. 추가 매수분은 별도 기록으로 관리합니다.')
+        with st.form('holding_entry_form', clear_on_submit=True):
+            a, b = st.columns(2)
+            symbol = a.text_input('보유 종목명 또는 6자리 코드', key='holding_symbol')
+            display_name = b.text_input('표시 종목명 (선택)', key='holding_name')
+            a, b, c = st.columns(3)
+            price = a.number_input('실제 매수가 (원)', min_value=0., step=100., key='holding_entry_price')
+            quantity = b.number_input('최초 매수 수량 (주)', min_value=1, step=1, key='holding_quantity')
+            stop = c.number_input('최초 손절가 (원)', min_value=0., step=100., key='holding_initial_stop')
+            date = st.date_input('실제 매수일', max_value=market_today(), key='holding_entry_date')
+            if st.form_submit_button('매수 체결 저장'):
+                try:
+                    query = symbol.strip()
+                    if query.isdigit() and len(query) == 6:
+                        code, name = query, display_name.strip() or query
+                    else:
+                        code, name = find_stock_code(query, load_krx_listing())
+                        name = display_name.strip() or name
+                    position = create_holding(code, name, price, quantity, date, stop)
+                    st.session_state['holding_book'] = book + [position]
+                    st.session_state['holding_selection'] = position['id']
+                    st.session_state['holding_notice'] = '실제 매수 체결을 저장했습니다. 보유 안내를 확인하세요.'
+                    st.rerun()
+                except ValueError as error:
+                    st.error(str(error))
+    if book:
+        a, b, c = st.columns(3)
+        a.metric('보유 중인 매수 기록', f'{len(active)}건')
+        b.metric('등록 보유분 손절 위험', f'{registered_holding_risk(book):,.0f}원')
+        c.metric('예상 비용 반영 실현손익', f"{sum(holding_guidance(p, None)['realized_pnl'] for p in book):+,}원")
+        st.caption('손절 위험은 등록 매수가·수량·적용한 손절가 기준입니다. 비용은 매수 0.05%·매도 0.20%를 가정합니다.')
+        labels = {p['id']: f"{p['name']} · 잔여 {holding_balance(p):,}주 · 매수 {p['entry_date']}" for p in book}
+        selected = st.selectbox('관리할 보유 내역', list(labels), format_func=labels.get, key='holding_selection')
+        index = next(i for i, p in enumerate(book) if p['id'] == selected)
+        position = book[index]
+        remaining = holding_balance(position)
+        if remaining:
+            s_date = (datetime.date.fromisoformat(position['entry_date']) - datetime.timedelta(days=150)).isoformat()
+            data = completed_live_history(load_price_history(position['code'], s_date))
+            guidance = holding_guidance(position, data)
+            if guidance['action'] != 'DATA' and dual_regime.get('data_date') and guidance.get('asof') != dual_regime['data_date']:
+                guidance = dict(guidance, action='DATA', label='시세 확인 필요', sell_quantity=0,
+                                reason='종목 시세와 최신 시장의 확정 기준일이 다릅니다. 재조회 후 확인하세요.')
+        else:
+            guidance = holding_guidance(position, None)
+        render = st.error if guidance['action'] in {'EXIT', 'REVIEW'} else st.warning if guidance['action'] in {'PARTIAL', 'DATA'} else st.info
+        render(f"**{guidance['label']}** · {guidance['reason']}")
+        if guidance.get('asof'):
+            st.caption(f"확정 시세 {guidance['asof']} · 보유 {guidance['days']}거래일 · 다음 거래일 행동 계획입니다. 가격 도달만으로 체결을 기록하지 않습니다.")
+            a, b, c = st.columns(3)
+            a.metric('최근 확정 종가', f"{guidance['close']:,.0f}원", f"{guidance['pnl_pct']:+.2f}%")
+            b.metric('잔여 수량', f'{remaining:,}주')
+            c.metric('청산 검토 수량', f"{guidance['sell_quantity']:,}주")
+            a, b, c = st.columns(3)
+            a.metric('등록 손절선', f"{guidance['stop']:,.0f}원")
+            b.metric('권장 보호선', f"{guidance['suggested_stop']:,.0f}원")
+            c.metric('비용 포함 평가손익', f"{guidance['unrealized_pnl']:+,}원")
+            targets = guidance['targets']
+            st.write(f'익절 목표: 1차 {targets[0]:,}원 → 2차 {targets[1]:,}원 → 잔여 전량 {targets[2]:,}원')
+            st.caption('분할 익절은 최초 수량의 30%·40%를 정수 주수로 계산하며 소량은 최소 1주입니다. 권장 보호선은 증권사에 설정한 뒤 변경 내역을 기록하세요.')
+        if remaining:
+            with st.expander('실제 매도 체결 기록', expanded=guidance['action'] in {'PARTIAL', 'EXIT', 'REVIEW'}):
+                key = f"sale_qty_{selected}"
+                st.session_state[key] = min(remaining, st.session_state.get(key, max(1, guidance['sell_quantity'])))
+                with st.form(f'sale_{selected}'):
+                    a, b = st.columns(2)
+                    qty = a.number_input('실제 매도 수량 (주)', min_value=1, max_value=remaining, key=key)
+                    price = b.number_input('실제 매도가 (원)', min_value=1., value=float(guidance.get('close', position['entry_price'])), step=100.)
+                    a, b = st.columns(2)
+                    date = a.date_input('실제 매도일', min_value=datetime.date.fromisoformat(position['entry_date']), max_value=market_today())
+                    options = ['기타', '1차 익절', '2차 익절', '전량 청산']
+                    default = guidance.get('kind', '전량 청산' if guidance['action'] in {'EXIT', 'REVIEW'} else '기타')
+                    kind = b.selectbox('매도 구분', options, index=options.index(default))
+                    if st.form_submit_button('매도 체결 저장'):
+                        try:
+                            updated = record_holding_sale(position, qty, price, date, kind)
+                            st.session_state['holding_book'] = book[:index] + [updated] + book[index+1:]
+                            st.session_state['holding_notice'] = '실제 매도 체결을 저장하고 잔여 수량을 갱신했습니다.'
+                            st.rerun()
+                        except ValueError as error:
+                            st.error(str(error))
+            with st.expander('적용한 손절가 변경 기록'):
+                current_stop = position['stop_updates'][-1]['price'] if position['stop_updates'] else position['initial_stop']
+                suggested = guidance.get('suggested_stop', current_stop)
+                with st.form(f'stop_{selected}'):
+                    stop = st.number_input('증권사에 적용한 손절가 (원)', min_value=float(current_stop), value=float(max(current_stop, suggested)), step=100.)
+                    date = st.date_input('손절가 변경일', min_value=datetime.date.fromisoformat(position['entry_date']), max_value=market_today())
+                    if st.form_submit_button('손절가 변경 저장'):
+                        try:
+                            updated = record_holding_stop(position, stop, date)
+                            st.session_state['holding_book'] = book[:index] + [updated] + book[index+1:]
+                            st.session_state['holding_notice'] = '적용한 손절가를 기록했습니다.'
+                            st.rerun()
+                        except ValueError as error:
+                            st.error(str(error))
+        if position['fills']:
+            with st.expander('실제 체결 내역'):
+                st.dataframe(pd.DataFrame(position['fills'])[['date', 'kind', 'quantity', 'price']], width='stretch')
+                if st.button('마지막 매도 입력 취소', key=f'undo_{selected}'):
+                    updated = dict(position, fills=position['fills'][:-1])
+                    st.session_state['holding_book'] = book[:index] + [updated] + book[index+1:]
+                    st.rerun()
+    else:
+        st.info('실제 매수 체결을 등록하면 보유 유지·부분 익절·손절·청산 안내를 확인할 수 있습니다.')
+    with st.expander('보유 내역 백업·복원'):
+        st.caption('내역은 이 브라우저 세션에 보관됩니다. 새로고침·서버 재시작에 대비해 백업 파일을 내려받으세요. 계좌를 자동 조회하거나 주문하지 않습니다.')
+        st.download_button('보유 내역 백업 다운로드', data=export_holding_book(book), file_name='holdings-backup.json', mime='application/json')
+        upload = st.file_uploader('보유 내역 백업 파일', type=['json'])
+        replace_book = st.checkbox('현재 목록을 백업으로 교체', value=False)
+        if st.button('백업 복원', disabled=upload is None):
+            try:
+                incoming = import_holding_book(upload.getvalue())
+                st.session_state['holding_book'] = incoming if replace_book else merge_holding_books(book, incoming)
+                st.session_state['reset_holding_selection'] = True
+                st.session_state['holding_notice'] = '보유 내역 백업을 복원했습니다.'
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
 
-    ---
-    ### 3. STEP 3 & 4 백테스트 성적표 읽는 법
-    "과거 2년 동안 이 규칙대로 매매했더라면 내 계좌가 어떻게 되었을까?"를 검증하는 성적표입니다.
 
-    | 지표 이름 | 초보자 눈높이 설명 | 기준 합격선 |
-    |---|---|---|
-    | **승률 (Win Rate)** | 10번 매매해서 몇 번 수익을 냈는가? | **45% ~ 55%** 면 충분히 훌륭함 (벌 때 크게 벌기 때문) |
-    | **일별 종가 MTM MDD** | 계좌 최고점 대비 가장 깊게 처박혔던 낙폭 | **-10% 이내**면 매우 우수, -15% 넘어가면 주의 |
-    | **Profit Factor (손익비)** | 번 돈 총합 ÷ 잃은 돈 총합 | **1.5 이상**을 참고하되 표본 수·손실 거래·OOS 결과를 함께 확인 |
-    | **기댓값 (Expectancy)** | 매매를 1번 완료할 때마다 계좌에 평균적으로 쌓이는 원화 | **플러스(+) 금액**이어야 함 |
+st.session_state.setdefault('holding_book', [])
+st.session_state.setdefault('selected_stock', '삼성전자')
+for key in ('diagnosis_stock', 'backtest_stock', 'stress_stock'):
+    st.session_state.setdefault(key, st.session_state['selected_stock'])
+st.sidebar.header('내 계좌 설정')
+acc_cap = st.sidebar.number_input('내 총 계좌 잔고 (원)', min_value=1000000, value=30000000, step=1000000)
+risk_pct_input = st.sidebar.slider('1회 허용 손실률 (%)', .3, 2., 1., step=.1)
+with st.sidebar.expander('계좌 손실 한도'):
+    live_total_risk_pct = st.number_input('계좌 전체 위험 한도 (%)', min_value=.5, max_value=10., value=3., step=.5, key='live_risk_limit')
+    unregistered_risk = st.number_input('미등록 보유분의 손절 위험 (원)', min_value=0, value=0, step=10000)
+registered_risk = registered_holding_risk(st.session_state['holding_book'])
+existing_stop_risk = registered_risk + unregistered_risk
+st.sidebar.caption(f'등록 보유분 위험: {registered_risk:,.0f}원 · 새 주문 수량에 자동 반영')
+st.sidebar.button('시세·시장 데이터 새로 조회', on_click=refresh_market_data)
+show_advanced = st.sidebar.checkbox('고급 분석 보기', value=False)
 
-    * **⚡ 3-모드 동시 삼각비교(Tricorder)**:
-      * **보수적 (Worst-Case)**: 같은 날 목표가와 손절가를 둘 다 건드렸다면 **무조건 손절당했다고 가정한 결과**입니다.
-      * **판단 팁**: 보수적 모드에서도 **수익률이 플러스이고 Profit Factor가 1.3 이상**을 유지한다면 추가 검증의 후보입니다. 작은 표본이나 생존 편향을 배제한 증거는 아닙니다.
-
-    ---
-    ### 4. 실전 매매 당일 행동 체크리스트
-    1. **오전 8:30 (장 시작 전)**: 앱 상단 **시장 국면(Regime)**을 확인합니다. 빨간불(RISK-OFF)이면 매매하지 않고 쉽니다.
-    2. **오전 8:40 (종목 진단)**: STEP 1에서 **진입 트랙**, **가격 4총사**, **권장 매수 주수**를 메모합니다.
-    3. **오전 9:00 (장 시작)**: `REBOUND`의 트리거·최대 진입가·무효화 가격을 확인하고 다음 거래일 한 번만 유효한 조건부 주문을 검토합니다.
-    4. **체결 직후 (필수 습관)**: 주식이 사지자마자 증권사 앱에서 **동적 손절선 가격에 '자동 감시 매도(Stop Loss)'**를 걸어둡니다.
-    5. **장중 주가 상승 시**: 1차 목표가에 도달하면 30%를 팔고, 남은 주식의 손절가를 **매수가(본전)**로 수정합니다.
-    """)
-
-# -------------------------------------------------------------
-# TAB 7: 시스템 무결성 헌장
-# -------------------------------------------------------------
-with tab7:
-    st.subheader("📖 QUANT-EXECUTION 무결성 실행 원칙")
-    st.markdown(r"""
-    1. **단일/포트폴리오 엔진 완전 일치 (Unified Core Execution)**:
-       * 단일 종목·포트폴리오 백테스트는 같은 지지·반등 조건, 진입 검사 및 포지션 청산 규칙을 사용합니다.
-       * REBOUND 조건부 진입 체결부터 +1.5R 도달 시 +0.5R 보호 스탑 상향, +2.0R 도달 시 +1.0R 보호 스탑 상향, 1.5 ATR Trailing, Trend Break 청산까지 완전히 동일하게 작동합니다.
-    2. **전체 자산 기준 리스크 사이징 (Portfolio Equity Risk Basis)**:
-       * 포트폴리오 백테스트 시 슬롯 배분 현금이 아닌 현재 포트폴리오 전체 총평가자산($Cash + \sum Value_{open}$)을 기준으로 설정한 손실 예산과 단일 종목 30% 비중 상한을 계산하여 현실적 자본 할당을 구현합니다.
-       * 포트폴리오 신규 매수에는 전체·동일 섹터·상관 종목군의 손절 위험 한도를 추가로 적용합니다. 갭 손실과 이후 평가액 변동은 한도를 초과할 수 있습니다.
-    3. **전면 슬리피지 및 다단계 분할 회계 원칙 (Full Friction Accounting)**:
-       * 최종 청산 가격으로 전체 수익률을 왜곡하지 않고, $T_1(30\%)$, $T_2(40\%)$, 잔여분의 실제 매도 유입 현금을 각각 집계하며, 지정가 익절(0.05%) 및 시장가 청산(0.10%) 슬리피지를 전면 차감하여 손익비를 계산합니다.
-    4. **정합적 손절 통제 원칙 (Harmonized Risk Defense)**:
-       * 가장 먼저 무너지는 핵심 지지선을 $max()$로 선택하되 최소 1.2 ATR 안전거리를 강제 확보하며, 손절폭이 -8.5% 이상인 종목은 거래 자체를 거부(WAIT)하여 자본 회전율을 방어합니다.
-    5. **일별 종가 MTM 평가 기준 (Close-to-Close MTM Transparency)**:
-       * 백테스트의 MDD 및 자산 곡선은 거래 종료 시점 기준이 아닌 매일 장 마감 종가 기준의 시가평가(MTM)로 측정되며, 장중 틱 단위 미세 낙폭은 배제된 일봉 기준 지표임을 명확히 규정합니다.
-    6. **모호봉 삼각비교 원칙 (Tricorder Comparison Policy)**:
-       * 당일 고가와 저가가 목표가와 손절가를 동시에 건드리는 모호한 일봉 발생 시, 보수적 모드(CONSERVATIVE), 중립 모드(NEUTRAL), 낙관 모드(OPTIMISTIC)를 동시 연산하여 안전 마진과 불확실성 델타를 명시합니다.
-    7. **전 종목 3단 계층 상대강도 및 진성 3D WFO (Universal 3-Tier RS & Multi-D WFO)**:
-       * KRX 전 종목 표준 업종을 5대 대표 ETF와 키워드 기반 추정 매핑하여 3단 상대강도를 매수 점수에 직접 반영하며, [Score x Trail x Hold] 27개 조합을 In-Sample에서 탐색한 뒤 60일 워밍업 정합성을 유지한 채 Out-of-Sample에 블라인드 동결 적용하여 전략의 영속성을 검증합니다.
-    """)
+dual_regime = get_current_dual_regime()
+st.title('매수 후보와 보유·청산 가이드')
+st.caption('화면 버전: TRADE-DESK-1 · 지지·반등 전략 SUPPORT-REBOUND-1')
+status = {'FAVORABLE':'신규 매수 검토 가능', 'NEUTRAL':'신규 매수 위험 예산 축소', 'RISK-OFF':'신규 매수 보류', 'UNKNOWN':'시장 데이터 확인 필요'}
+st.info(f"시장: {status[dual_regime['code']]} · 기준일 {dual_regime.get('data_date') or '확인 불가'}")
+with st.expander('사용 방법과 데이터 기준'):
+    st.markdown('매수 후보에서 종목을 선택하고 매매 계획을 확인하세요. 실제 매수한 뒤 보유 내역을 등록하고, 실제 매도 체결을 기록하면 다음 익절·손절 안내로 이어집니다.')
+    st.caption('확정 일봉으로 다음 거래일 계획을 안내합니다. 당일 봉은 15:40 KST 이후 실제 조회된 데이터부터 사용하며, 장중 체결과 손절가는 증권사에서 확인하세요. 상위 후보는 정해진 지지·반등 조건에 따른 결과입니다.')
+main_view = st.radio('화면', ['오늘의 매수 후보', '내 보유종목 관리'], horizontal=True, key='main_view', label_visibility='collapsed')
+if main_view == '오늘의 매수 후보':
+    render_buy_candidates(dual_regime)
+    st.divider()
+    render_trade_plan(dual_regime, acc_cap, risk_pct_input, live_total_risk_pct, existing_stop_risk)
+else:
+    render_holdings(dual_regime)
+if show_advanced:
+    st.divider()
+    st.subheader('고급 분석')
+    selection = st.selectbox('분석 도구', ['단일 종목 백테스트', '다종목 포트폴리오', 'WFO·슬리피지 검증'])
+    if selection == '단일 종목 백테스트':
+        render_single_analysis()
+    elif selection == '다종목 포트폴리오':
+        render_portfolio_analysis()
+    else:
+        render_wfo_analysis()

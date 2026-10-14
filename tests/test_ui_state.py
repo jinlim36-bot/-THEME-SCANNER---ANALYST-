@@ -23,6 +23,8 @@ def fixture_listing(*args):
                          'Close': [10000]*3, 'Volume': [1000000]*3,
                          'Marcap': [1e12]*3, 'Amount': [1e10]*3})
 def fixture_prices(code, *args):
+    if st.session_state.get('_test_quote_missing', False):
+        return pd.DataFrame()
     if code == '005930':
         return pd.DataFrame()
     if code == '123456':
@@ -72,11 +74,13 @@ class UIStateTests(unittest.TestCase):
 
     def test_transfer_updates_all_three_inputs_in_the_same_rerun(self):
         self.seed_results()
-        self.button('선택 종목을 STEP 1으로 전송').click().run()
+        self.button('이 종목의 매매 계획 보기').click().run()
         self.assertFalse(self.app.exception)
-        for key in ('diagnosis_stock', 'backtest_stock', 'stress_stock'):
-            self.assertEqual(self.app.text_input(key=key).value, 'SK하이닉스')
-        self.app.run()
+        self.assertEqual(self.app.text_input(key='diagnosis_stock').value, 'SK하이닉스')
+        self.assertTrue(any('진입 대기' in item.value for item in self.app.success))
+        next(c for c in self.app.checkbox if c.label == '고급 분석 보기').check().run()
+        self.assertEqual(self.app.text_input(key='backtest_stock').value, 'SK하이닉스')
+        next(s for s in self.app.selectbox if s.label == '분석 도구').set_value('WFO·슬리피지 검증').run()
         self.assertEqual(self.app.text_input(key='stress_stock').value, 'SK하이닉스')
 
     def test_expired_result_cannot_be_transferred_from_an_open_page(self):
@@ -84,14 +88,14 @@ class UIStateTests(unittest.TestCase):
         metadata = dict(self.app.session_state['screened_meta'])
         metadata['created_at'] -= 3601
         self.app.session_state['screened_meta'] = metadata
-        self.button('선택 종목을 STEP 1으로 전송').click().run()
+        self.button('이 종목의 매매 계획 보기').click().run()
         self.assertFalse(self.app.exception)
         self.assertNotIn('screened_res', self.app.session_state)
         self.assertEqual(self.app.text_input(key='diagnosis_stock').value, '삼성전자')
 
     def test_refresh_removes_previous_buy_results(self):
         self.seed_results()
-        self.assertEqual(len(self.app.dataframe), 1)
+        self.assertGreaterEqual(len(self.app.dataframe), 1)
         self.button('시세·시장 데이터 새로 조회').click().run()
         self.assertFalse(self.app.exception)
         self.assertNotIn('screened_res', self.app.session_state)
@@ -113,7 +117,7 @@ class UIStateTests(unittest.TestCase):
         self.assertFalse(self.app.exception)
 
     def test_scan_preserves_counts_and_distinguishes_provider_failures(self):
-        self.button('Buy Zone 종목 스캔 시작').click().run()
+        self.button('매수 후보 찾기').click().run()
         self.assertFalse(self.app.exception)
         counts = self.app.session_state['screened_meta']['counts']
         self.assertEqual(counts, dict(evaluated=1, missing=1, failed=1, supply_missing=0))
@@ -121,13 +125,13 @@ class UIStateTests(unittest.TestCase):
         self.assertEqual(len(self.app.session_state['screened_res']), 1)
         self.assertIn('시세기준일', self.app.session_state['screened_res'])
         self.app.run()
-        self.assertEqual(len(self.app.dataframe), 1)
+        self.assertGreaterEqual(len(self.app.dataframe), 1)
 
 
     def test_risk_off_keeps_real_confirmed_pattern_as_observation(self):
         self.app.session_state['_test_regime'] = 'RISK-OFF'
         self.app.run()
-        self.button('Buy Zone 종목 스캔 시작').click().run()
+        self.button('매수 후보 찾기').click().run()
         self.assertFalse(self.app.exception)
         self.assertTrue(self.app.session_state['screened_res'].empty)
         watch = self.app.session_state['screened_watch']
@@ -135,9 +139,9 @@ class UIStateTests(unittest.TestCase):
         self.assertEqual(watch['패턴상태'].iloc[0], '반등 확인 · 돌파 대기')
         self.assertIn('RISK-OFF', watch['보류·진입 근거'].iloc[0])
         self.assertEqual(self.app.session_state['screened_meta']['gates']['MARKET'], 1)
-        self.button('선택 종목을 STEP 1으로 전송').click().run()
+        self.button('이 종목의 매매 계획 보기').click().run()
         self.assertEqual(self.app.text_input(key='diagnosis_stock').value, 'SK하이닉스')
-        self.button('실행 계획 정밀 진단').click().run()
+        self.button('매매 계획 확인').click().run()
         self.assertFalse(self.app.exception)
         self.assertTrue(any('RISK-OFF' in item.value for item in self.app.error))
         self.button('시세·시장 데이터 새로 조회').click().run()
@@ -147,7 +151,7 @@ class UIStateTests(unittest.TestCase):
     def test_unknown_market_preserves_observation_without_a_buy_plan(self):
         self.app.session_state['_test_regime'] = 'UNKNOWN'
         self.app.run()
-        self.button('Buy Zone 종목 스캔 시작').click().run()
+        self.button('매수 후보 찾기').click().run()
         self.assertFalse(self.app.exception)
         self.assertTrue(self.app.session_state['screened_res'].empty)
         watch = self.app.session_state['screened_watch']
@@ -159,7 +163,7 @@ class UIStateTests(unittest.TestCase):
     def test_no_support_touch_is_an_observation_despite_a_high_score(self):
         self.app.session_state['_test_no_touch'] = True
         self.app.run()
-        self.button('Buy Zone 종목 스캔 시작').click().run()
+        self.button('매수 후보 찾기').click().run()
         self.assertFalse(self.app.exception)
         self.assertTrue(self.app.session_state['screened_res'].empty)
         watch = self.app.session_state['screened_watch']
@@ -168,20 +172,20 @@ class UIStateTests(unittest.TestCase):
         self.assertGreaterEqual(watch['스코어'].iloc[0], 70)
 
     def test_real_diagnosis_displays_next_session_trigger_and_sized_plan(self):
-        self.button('실행 계획 정밀 진단').click().run()
+        self.button('매매 계획 확인').click().run()
         self.assertFalse(self.app.exception)
         labels = [metric.label for metric in self.app.metric]
         self.assertIn('조건부 진입 트리거', labels)
-        self.assertTrue(any('조건부 진입' in item.value for item in self.app.success))
+        self.assertTrue(any('진입 대기' in item.value for item in self.app.success))
         shares = next(m for m in self.app.metric if m.label == '최종 권장 매수 수량')
         self.assertNotEqual(shares.value, '0주')
 
 
     def test_displayed_shares_respect_budget_even_at_the_maximum_entry_price(self):
-        self.button('Buy Zone 종목 스캔 시작').click().run()
+        self.button('매수 후보 찾기').click().run()
         row = self.app.session_state['screened_res'].iloc[0]
         next(s for s in self.app.slider if s.label == '1회 허용 손실률 (%)').set_value(.3).run()
-        self.button('실행 계획 정밀 진단').click().run()
+        self.button('매매 계획 확인').click().run()
         self.assertFalse(self.app.exception)
         value = next(m.value for m in self.app.metric if m.label == '최종 권장 매수 수량')
         shares = int(value.replace(',', '').replace('주', ''))
