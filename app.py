@@ -68,9 +68,59 @@ def load_price_history(symbol, start_date):
         return pd.DataFrame()
 
 
+def normalize_published_listing(content):
+    data = pd.read_csv(io.BytesIO(content), dtype={'Code': str, 'MarketId': str})
+    required = {'Code', 'Name', 'MarketId', 'Close', 'Volume', 'Amount', 'Marcap'}
+    if data.empty or not required.issubset(data.columns):
+        raise ValueError('종목 목록의 필수 항목이 없습니다.')
+    if data['Code'].isna().any() or not data['Code'].str.fullmatch(r'[0-9A-Z]{6}').all() or data['Name'].isna().any():
+        raise ValueError('종목 코드 또는 이름이 올바르지 않습니다.')
+    if not data['MarketId'].isin(['STK', 'KSQ', 'KNX']).all():
+        raise ValueError('종목 시장 구분이 올바르지 않습니다.')
+    for column in ['Close', 'Volume', 'Amount', 'Marcap']:
+        data[column] = pd.to_numeric(data[column], errors='coerce')
+        if not np.isfinite(data[column]).all() or (data[column] < 0).any():
+            raise ValueError('종목 목록의 가격·거래량·시가총액이 올바르지 않습니다.')
+    return data.drop_duplicates('Code').reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600)
+def load_published_krx_listing():
+    """Read FDR's own public daily snapshots without its KRX date bootstrap."""
+    today = market_today()
+    last_error = None
+    for offset in range(8):
+        date = today - datetime.timedelta(days=offset)
+        if date.weekday() >= 5:
+            continue
+        url = ('https://raw.githubusercontent.com/FinanceData/fdr_krx_data_cache/'
+               f'refs/heads/master/data/listing/krx/{date.isoformat()}.csv')
+        try:
+            response = requests.get(url, timeout=8)
+            if response.status_code == 404:
+                continue  # Today's publication may not exist yet; try the prior session.
+            response.raise_for_status()
+            data = normalize_published_listing(response.content)
+            data.attrs.update(listing_date=date.isoformat(), source='FinanceDataReader 공개 일별 목록')
+            return data
+        except Exception as error:
+            last_error = type(error).__name__
+            logger.warning('Published KRX listing unavailable [%s]: %s', date, last_error)
+            break
+    st.warning('최근 7일 이내의 종목 목록을 확인하지 못했습니다.'
+               + (f' ({last_error})' if last_error else ''))
+    return pd.DataFrame()
+
+
 @st.cache_data(ttl=3600)
 def load_stock_listing(market):
     try:
+        if market in {'KOSPI', 'KOSDAQ', 'KONEX', 'KRX', 'KRX-MARCAP'}:
+            data = load_published_krx_listing()
+            if data.empty:
+                return data
+            market_id = {'KOSPI': 'STK', 'KOSDAQ': 'KSQ', 'KONEX': 'KNX'}.get(market)
+            return data.loc[data['MarketId'] == market_id].copy() if market_id else data.copy()
         data = fdr.StockListing(market)
         return data if data is not None else pd.DataFrame()
     except Exception as error:
@@ -1946,6 +1996,8 @@ def render_buy_candidates(dual_regime):
             elif not {'Code', 'Name', 'Close', 'Volume', 'Marcap'}.issubset(df_k.columns):
                 st.error('코스피 종목 목록의 필수 항목이 누락되어 스캔을 중단했습니다.')
             else:
+                if df_k.attrs.get('listing_date'):
+                    st.caption(f"종목 목록 기준일: {df_k.attrs['listing_date']} · {df_k.attrs['source']}")
                 df_k = df_k.copy()
                 df_k['Code'] = df_k['Code'].astype(str).str.zfill(6)
                 for num_col in ['Close', 'Volume', 'Amount', 'Marcap']:
@@ -2490,7 +2542,7 @@ show_advanced = st.sidebar.checkbox('고급 분석 보기', value=False)
 
 dual_regime = get_current_dual_regime()
 st.title('매수 후보와 보유·청산 가이드')
-st.caption('화면 버전: TRADE-DESK-1 · 지지·반등 전략 SUPPORT-REBOUND-1')
+st.caption('화면 버전: TRADE-DESK-1.1 · 지지·반등 전략 SUPPORT-REBOUND-1')
 status = {'FAVORABLE':'신규 매수 검토 가능', 'NEUTRAL':'신규 매수 위험 예산 축소', 'RISK-OFF':'신규 매수 보류', 'UNKNOWN':'시장 데이터 확인 필요'}
 st.info(f"시장: {status[dual_regime['code']]} · 기준일 {dual_regime.get('data_date') or '확인 불가'}")
 with st.expander('사용 방법과 데이터 기준'):
